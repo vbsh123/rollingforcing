@@ -4,10 +4,10 @@ import time
 from typing import Optional
 
 import torch
-from torchvision.io import write_video
 from omegaconf import OmegaConf
 from einops import rearrange
 import gradio as gr
+import imageio
 
 from pipeline import CausalDiffusionInferencePipeline, CausalInferencePipeline
 
@@ -109,7 +109,7 @@ def build_predict(config_path: str, checkpoint_path: Optional[str], output_dir: 
         safe_stub = prompt[:60].replace(' ', '_').replace('/', '_')
         ts = int(time.time())
         filepath = os.path.join(output_dir, f"{safe_stub or 'video'}_{ts}.mp4")
-        write_video(filepath, video_uint8, fps=16)
+        imageio.mimwrite(filepath, video_uint8, fps=16, quality=8, output_params=["-loglevel", "error"])
         print(f"Saved generated video to {filepath}")
 
         return filepath

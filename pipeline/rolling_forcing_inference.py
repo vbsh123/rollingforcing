@@ -42,6 +42,126 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
+        self.tokentrim_enabled = bool(getattr(args, "tokentrim_enabled", False))
+        self.tokentrim_state = None
+        self.tokentrim_prev_summary = None
+        self.tokentrim_prev_start_frame = None
+        if self.tokentrim_enabled:
+            try:
+                from tokentrim import TokenTrimConfig, TokenTrimState
+                from tokentrim import suppress_rolling_forcing_cache_tokens, wan_latents_to_token_summary
+            except ImportError as exc:
+                raise ImportError(
+                    "tokentrim_enabled=True requires installing the TokenTrim package, "
+                    "for example: pip install -e ../TokenTrim"
+                ) from exc
+
+            self._tokentrim_state_cls = TokenTrimState
+            self._tokentrim_latent_summary = wan_latents_to_token_summary
+            self._tokentrim_suppress_cache = suppress_rolling_forcing_cache_tokens
+            self.tokentrim_config = TokenTrimConfig(
+                pruning_fraction=float(getattr(args, "tokentrim_pruning_fraction", 0.10)),
+                lambda_threshold=float(getattr(args, "tokentrim_lambda_threshold", 2.0)),
+                warmup_steps=int(getattr(args, "tokentrim_warmup_steps", 2)),
+            )
+            self.tokentrim_sink_blocks = int(getattr(args, "tokentrim_sink_blocks", 1))
+            self.tokentrim_max_rerolls = int(getattr(args, "tokentrim_max_rerolls", 1))
+            self.tokentrim_patch_size = tuple(getattr(args, "tokentrim_patch_size", [2, 2]))
+            self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
+
+    @staticmethod
+    def _clone_kv_cache(kv_cache):
+        return [
+            {
+                key: value.clone() if torch.is_tensor(value) else value
+                for key, value in layer_cache.items()
+            }
+            for layer_cache in kv_cache
+        ]
+
+    @staticmethod
+    def _restore_kv_cache(target, snapshot):
+        for target_layer, source_layer in zip(target, snapshot):
+            for key, value in source_layer.items():
+                if torch.is_tensor(value):
+                    target_layer[key].copy_(value)
+                else:
+                    target_layer[key] = value
+
+    def _maybe_tokentrim_reroll(
+            self,
+            denoised_pred,
+            noisy_input,
+            conditional_dict,
+            current_timestep,
+            current_start_frame,
+            cache_snapshot
+    ):
+        if not self.tokentrim_enabled:
+            return denoised_pred
+        if denoised_pred.shape[0] != 1:
+            raise ValueError("The current TokenTrim integration supports batch_size=1 / num_samples=1")
+
+        candidate_block = denoised_pred[:, :self.num_frame_per_block]
+        current_summary = self._tokentrim_latent_summary(
+            candidate_block,
+            patch_size=self.tokentrim_patch_size,
+        )
+
+        if self.tokentrim_prev_summary is None:
+            self.tokentrim_prev_summary = current_summary.detach()
+            self.tokentrim_prev_start_frame = current_start_frame
+            return denoised_pred
+
+        if self.tokentrim_prev_start_frame == current_start_frame:
+            self.tokentrim_prev_summary = current_summary.detach()
+            return denoised_pred
+
+        result = self.tokentrim_state.evaluate_summaries(
+            self.tokentrim_prev_summary,
+            current_summary,
+        )
+
+        rerolls_remaining = self.tokentrim_max_rerolls
+        while result.should_prune and rerolls_remaining > 0:
+            print(
+                "TokenTrim pruning:",
+                f"severity={result.severity:.4f}",
+                f"threshold={result.threshold:.4f}" if result.threshold is not None else "threshold=None",
+                f"rerolls_remaining={rerolls_remaining}",
+            )
+            self._restore_kv_cache(self.kv_cache_clean, cache_snapshot)
+            self._tokentrim_suppress_cache(
+                self.kv_cache_clean,
+                result.token_indices[0],
+                frame_seq_length=self.frame_seq_length,
+                block_length=self.num_frame_per_block * self.frame_seq_length,
+                sink_blocks=self.tokentrim_sink_blocks,
+            )
+            _, denoised_pred = self.generator(
+                noisy_image_or_video=noisy_input,
+                conditional_dict=conditional_dict,
+                timestep=current_timestep,
+                kv_cache=self.kv_cache_clean,
+                crossattn_cache=self.crossattn_cache,
+                current_start=current_start_frame * self.frame_seq_length
+            )
+            candidate_block = denoised_pred[:, :self.num_frame_per_block]
+            current_summary = self._tokentrim_latent_summary(
+                candidate_block,
+                patch_size=self.tokentrim_patch_size,
+            )
+            result = self.tokentrim_state.evaluate_summaries(
+                self.tokentrim_prev_summary,
+                current_summary,
+            )
+            rerolls_remaining -= 1
+
+        self.tokentrim_state.accept(result)
+        self.tokentrim_prev_summary = current_summary.detach()
+        self.tokentrim_prev_start_frame = current_start_frame
+        return denoised_pred
+
     def inference_rolling_forcing(
         self,
         noise: torch.Tensor,
@@ -67,6 +187,11 @@ class CausalInferencePipeline(torch.nn.Module):
                 It is normalized to be in the range [0, 1].
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        if self.tokentrim_enabled:
+            self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
+            self.tokentrim_prev_summary = None
+            self.tokentrim_prev_start_frame = None
+
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             # If the first frame is independent and the first frame is provided, then the number of frames in the
             # noise should still be a multiple of num_frame_per_block
@@ -232,6 +357,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
 
             # calling DiT
+            tokentrim_cache_snapshot = self._clone_kv_cache(self.kv_cache_clean) if self.tokentrim_enabled else None
             _, denoised_pred = self.generator(
                     noisy_image_or_video=noisy_input,
                     conditional_dict=conditional_dict,
@@ -240,6 +366,15 @@ class CausalInferencePipeline(torch.nn.Module):
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length
                 )
+
+            denoised_pred = self._maybe_tokentrim_reroll(
+                denoised_pred=denoised_pred,
+                noisy_input=noisy_input,
+                conditional_dict=conditional_dict,
+                current_timestep=current_timestep,
+                current_start_frame=current_start_frame,
+                cache_snapshot=tokentrim_cache_snapshot,
+            )
 
             output[:, current_start_frame:current_end_frame] = denoised_pred
                 

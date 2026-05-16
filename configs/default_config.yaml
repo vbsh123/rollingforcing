@@ -9,6 +9,15 @@ num_training_frames: 27
 gc_interval: 100
 context_noise: 0
 causal: true
+tokentrim_enabled: false
+tokentrim_pruning_fraction: 0.10
+tokentrim_lambda_threshold: 2.0
+tokentrim_warmup_steps: 2
+tokentrim_sink_blocks: 1
+tokentrim_max_rerolls: 1
+tokentrim_patch_size:
+- 2
+- 2
 
 ckpt_step: 0
 prompt_name: MovieGenVideoBench
