@@ -15,6 +15,7 @@ tokentrim_lambda_threshold: 2.0
 tokentrim_warmup_steps: 2
 tokentrim_sink_blocks: 1
 tokentrim_max_rerolls: 1
+tokentrim_debug: false
 tokentrim_patch_size:
 - 2
 - 2

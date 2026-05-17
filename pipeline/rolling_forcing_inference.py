@@ -66,6 +66,7 @@ class CausalInferencePipeline(torch.nn.Module):
             )
             self.tokentrim_sink_blocks = int(getattr(args, "tokentrim_sink_blocks", 1))
             self.tokentrim_max_rerolls = int(getattr(args, "tokentrim_max_rerolls", 1))
+            self.tokentrim_debug = bool(getattr(args, "tokentrim_debug", False))
             self.tokentrim_patch_size = tuple(getattr(args, "tokentrim_patch_size", [2, 2]))
             self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
 
@@ -121,6 +122,15 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_prev_summary,
             current_summary,
         )
+        if self.tokentrim_debug:
+            print(
+                "TokenTrim decision:",
+                f"decision={result.decision.value}",
+                f"severity={result.severity:.4f}",
+                f"threshold={result.threshold:.4f}" if result.threshold is not None else "threshold=None",
+                f"stats_count={result.stats_count}",
+                f"start_frame={current_start_frame}",
+            )
 
         rerolls_remaining = self.tokentrim_max_rerolls
         while result.should_prune and rerolls_remaining > 0:
@@ -155,6 +165,15 @@ class CausalInferencePipeline(torch.nn.Module):
                 self.tokentrim_prev_summary,
                 current_summary,
             )
+            if self.tokentrim_debug:
+                print(
+                    "TokenTrim reroll decision:",
+                    f"decision={result.decision.value}",
+                    f"severity={result.severity:.4f}",
+                    f"threshold={result.threshold:.4f}" if result.threshold is not None else "threshold=None",
+                    f"stats_count={result.stats_count}",
+                    f"start_frame={current_start_frame}",
+                )
             rerolls_remaining -= 1
 
         self.tokentrim_state.accept(result)
