@@ -1,4 +1,5 @@
 from typing import List, Optional
+import gc
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
@@ -463,9 +464,17 @@ class CausalInferencePipeline(torch.nn.Module):
             init_time = init_start.elapsed_time(init_end)
             vae_start.record()
 
-        # Step 4: Decode the output
+        # Step 4: Decode the output. Long runs are decode-memory bound, so drop
+        # rolling inference state before expanding latents into pixel frames.
+        del noisy_cache
+        self.kv_cache_clean = None
+        self.crossattn_cache = None
+        self.tokentrim_prev_summary = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
         video = self.vae.decode_to_pixel(output, use_cache=False)
-        video = (video * 0.5 + 0.5).clamp(0, 1)
+        video.mul_(0.5).add_(0.5).clamp_(0, 1)
 
         if profile:
             # End VAE timing and synchronize CUDA
