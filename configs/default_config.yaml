@@ -17,8 +17,10 @@ tokentrim_sink_blocks: 1
 tokentrim_max_rerolls: 1
 tokentrim_debug: false
 tokentrim_patch_size:
-- 2
-- 2
+  - 2
+  - 2
+tokentrim_rollback_windows: 0
+tokentrim_rollback_max_attempts: 0
 
 ckpt_step: 0
 prompt_name: MovieGenVideoBench
