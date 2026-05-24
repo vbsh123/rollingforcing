@@ -72,6 +72,7 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_patch_size = tuple(getattr(args, "tokentrim_patch_size", [2, 2]))
             self.tokentrim_rollback_windows = int(getattr(args, "tokentrim_rollback_windows", 0))
             self.tokentrim_rollback_max_attempts = int(getattr(args, "tokentrim_rollback_max_attempts", 0))
+            self.tokentrim_rollback_experimental = bool(getattr(args, "tokentrim_rollback_experimental", False))
             self.tokentrim_last_pruned = False
             self.tokentrim_last_token_indices = None
             self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
@@ -410,7 +411,11 @@ class CausalInferencePipeline(torch.nn.Module):
             current_end_frame = (end_block + 1) * self.num_frame_per_block # not include
             current_num_frames = current_end_frame - current_start_frame
 
-            if self.tokentrim_enabled and self.tokentrim_rollback_windows > 0:
+            if (
+                    self.tokentrim_enabled
+                    and self.tokentrim_rollback_experimental
+                    and self.tokentrim_rollback_windows > 0
+            ):
                 checkpoint_start_frame = current_start_frame
                 tokentrim_rollback_history[window_index] = {
                     "start_frame": checkpoint_start_frame,
@@ -469,6 +474,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
             if (
                     self.tokentrim_enabled
+                    and self.tokentrim_rollback_experimental
                     and self.tokentrim_rollback_windows > 0
                     and self.tokentrim_rollback_max_attempts > 0
                     and self.tokentrim_last_pruned

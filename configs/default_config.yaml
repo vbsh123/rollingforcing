@@ -21,6 +21,7 @@ tokentrim_patch_size:
   - 2
 tokentrim_rollback_windows: 0
 tokentrim_rollback_max_attempts: 0
+tokentrim_rollback_experimental: false
 
 ckpt_step: 0
 prompt_name: MovieGenVideoBench
