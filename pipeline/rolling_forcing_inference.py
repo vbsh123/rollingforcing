@@ -632,6 +632,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 cache_snapshot=tokentrim_cache_snapshot,
             )
 
+            tokentrim_candidate_recorded = False
             if (
                     tokentrim_active_candidate is not None
                     and tokentrim_active_candidate["window_index"] == window_index
@@ -650,12 +651,15 @@ class CausalInferencePipeline(torch.nn.Module):
                     f"pruned={self.tokentrim_last_pruned}",
                 )
                 tokentrim_active_candidate = None
+                tokentrim_candidate_recorded = True
 
             if (
                     self.tokentrim_enabled
                     and self.tokentrim_rollback_experimental
                     and self.tokentrim_rollback_windows > 0
                     and self.tokentrim_rollback_max_attempts > 0
+                    and tokentrim_active_candidate is None
+                    and not tokentrim_candidate_recorded
                     and self.tokentrim_last_pruned
             ):
                 attempts_used = tokentrim_rollback_attempts.get(window_index, 0)
