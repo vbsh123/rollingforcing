@@ -87,26 +87,7 @@ class CausalInferencePipeline(torch.nn.Module):
         ]
 
     @staticmethod
-    def _clone_crossattn_cache(crossattn_cache):
-        return [
-            {
-                key: value.clone() if torch.is_tensor(value) else value
-                for key, value in layer_cache.items()
-            }
-            for layer_cache in crossattn_cache
-        ]
-
-    @staticmethod
     def _restore_kv_cache(target, snapshot):
-        for target_layer, source_layer in zip(target, snapshot):
-            for key, value in source_layer.items():
-                if torch.is_tensor(value):
-                    target_layer[key].copy_(value)
-                else:
-                    target_layer[key] = value
-
-    @staticmethod
-    def _restore_crossattn_cache(target, snapshot):
         for target_layer, source_layer in zip(target, snapshot):
             for key, value in source_layer.items():
                 if torch.is_tensor(value):
@@ -435,8 +416,6 @@ class CausalInferencePipeline(torch.nn.Module):
                     "start_frame": checkpoint_start_frame,
                     "output_tail": output[:, checkpoint_start_frame:].detach().clone(),
                     "noisy_cache_tail": noisy_cache[:, checkpoint_start_frame:].detach().clone(),
-                    "kv_cache": self._clone_kv_cache(self.kv_cache_clean),
-                    "crossattn_cache": self._clone_crossattn_cache(self.crossattn_cache),
                     "state": copy.deepcopy(self.tokentrim_state),
                     "prev_summary": (
                         None if self.tokentrim_prev_summary is None else self.tokentrim_prev_summary.detach().clone()
@@ -465,7 +444,11 @@ class CausalInferencePipeline(torch.nn.Module):
 
 
             # calling DiT
-            tokentrim_cache_snapshot = self._clone_kv_cache(self.kv_cache_clean) if self.tokentrim_enabled else None
+            tokentrim_cache_snapshot = (
+                self._clone_kv_cache(self.kv_cache_clean)
+                if self.tokentrim_enabled and self.tokentrim_max_rerolls > 0
+                else None
+            )
             _, denoised_pred = self.generator(
                     noisy_image_or_video=noisy_input,
                     conditional_dict=conditional_dict,
@@ -509,8 +492,12 @@ class CausalInferencePipeline(torch.nn.Module):
                         None if target_history["prev_summary"] is None else target_history["prev_summary"].detach().clone()
                     )
                     self.tokentrim_prev_start_frame = target_history["prev_start_frame"]
-                    self._restore_kv_cache(self.kv_cache_clean, target_history["kv_cache"])
-                    self._restore_crossattn_cache(self.crossattn_cache, target_history["crossattn_cache"])
+                    self._rebuild_clean_cache_from_output(
+                        output=output,
+                        conditional_dict=conditional_dict,
+                        window_start_blocks=window_start_blocks,
+                        up_to_window_index=target_window_index,
+                    )
                     if self.tokentrim_last_token_indices is not None:
                         self._tokentrim_suppress_cache(
                             self.kv_cache_clean,
