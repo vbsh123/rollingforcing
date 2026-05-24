@@ -1,5 +1,4 @@
 from typing import List, Optional
-import copy
 import gc
 import torch
 
@@ -73,6 +72,9 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_rollback_windows = int(getattr(args, "tokentrim_rollback_windows", 0))
             self.tokentrim_rollback_max_attempts = int(getattr(args, "tokentrim_rollback_max_attempts", 0))
             self.tokentrim_rollback_experimental = bool(getattr(args, "tokentrim_rollback_experimental", False))
+            if self.tokentrim_rollback_experimental and self.tokentrim_max_rerolls > 0:
+                print("TokenTrim rollback disables current-window rerolls to avoid KV cache snapshots.")
+                self.tokentrim_max_rerolls = 0
             self.tokentrim_last_pruned = False
             self.tokentrim_last_token_indices = None
             self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
@@ -228,6 +230,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 )
             rerolls_remaining -= 1
 
+        self.tokentrim_last_pruned = result.should_prune
+        self.tokentrim_last_token_indices = result.token_indices.detach()
         self.tokentrim_state.accept(result)
         self.tokentrim_prev_summary = current_summary.detach()
         self.tokentrim_prev_start_frame = current_start_frame
@@ -392,8 +396,10 @@ class CausalInferencePipeline(torch.nn.Module):
             shared_timestep[:, index * self.num_frame_per_block:(index + 1) * self.num_frame_per_block] *= current_timestep
 
 
-        tokentrim_rollback_history = {}
+        tokentrim_rollback_suppressions = {}
         tokentrim_rollback_attempts = {}
+        initial_cpu_rng_state = torch.get_rng_state()
+        initial_cuda_rng_state = torch.cuda.get_rng_state(noise.device) if noise.device.type == "cuda" else None
 
         # Denoising loop with rolling forcing
         window_index = 0
@@ -410,23 +416,6 @@ class CausalInferencePipeline(torch.nn.Module):
             current_start_frame = start_block * self.num_frame_per_block
             current_end_frame = (end_block + 1) * self.num_frame_per_block # not include
             current_num_frames = current_end_frame - current_start_frame
-
-            if (
-                    self.tokentrim_enabled
-                    and self.tokentrim_rollback_experimental
-                    and self.tokentrim_rollback_windows > 0
-            ):
-                checkpoint_start_frame = current_start_frame
-                tokentrim_rollback_history[window_index] = {
-                    "start_frame": checkpoint_start_frame,
-                    "output_tail": output[:, checkpoint_start_frame:].detach().clone(),
-                    "noisy_cache_tail": noisy_cache[:, checkpoint_start_frame:].detach().clone(),
-                    "state": copy.deepcopy(self.tokentrim_state),
-                    "prev_summary": (
-                        None if self.tokentrim_prev_summary is None else self.tokentrim_prev_summary.detach().clone()
-                    ),
-                    "prev_start_frame": self.tokentrim_prev_start_frame,
-                }
 
             # noisy_input: new noise and previous denoised noisy frames, only last block is pure noise
             if current_num_frames == rolling_window_length_blocks * self.num_frame_per_block or current_start_frame == 0:
@@ -447,6 +436,20 @@ class CausalInferencePipeline(torch.nn.Module):
             else:
                 raise ValueError("current_num_frames should be equal to rolling_window_length_blocks * self.num_frame_per_block, or the first or last window.")
 
+
+            if self.tokentrim_enabled and window_index in tokentrim_rollback_suppressions:
+                print(
+                    "TokenTrim rollback suppression:",
+                    f"window={window_index}",
+                    f"tokens={tokentrim_rollback_suppressions[window_index].numel()}",
+                )
+                self._tokentrim_suppress_cache(
+                    self.kv_cache_clean,
+                    tokentrim_rollback_suppressions[window_index],
+                    frame_seq_length=self.frame_seq_length,
+                    block_length=self.num_frame_per_block * self.frame_seq_length,
+                    sink_blocks=self.tokentrim_sink_blocks,
+                )
 
             # calling DiT
             tokentrim_cache_snapshot = (
@@ -481,38 +484,47 @@ class CausalInferencePipeline(torch.nn.Module):
             ):
                 target_window_index = max(0, window_index - self.tokentrim_rollback_windows)
                 attempts_used = tokentrim_rollback_attempts.get(window_index, 0)
-                target_history = tokentrim_rollback_history.get(target_window_index)
-                if target_window_index < window_index and attempts_used < self.tokentrim_rollback_max_attempts and target_history:
+                if initial_latent is not None:
                     print(
-                        "TokenTrim rollback:",
+                        "TokenTrim rollback skipped:",
+                        "reason=initial_latent_not_supported",
+                        f"from_window={window_index}",
+                    )
+                elif target_window_index >= window_index:
+                    print(
+                        "TokenTrim rollback skipped:",
+                        "reason=too_early",
+                        f"from_window={window_index}",
+                    )
+                elif attempts_used >= self.tokentrim_rollback_max_attempts:
+                    print(
+                        "TokenTrim rollback skipped:",
+                        "reason=max_attempts_reached",
+                        f"from_window={window_index}",
+                        f"attempts={attempts_used}",
+                    )
+                else:
+                    print(
+                        "TokenTrim rollback restart:",
                         f"from_window={window_index}",
                         f"to_window={target_window_index}",
                         f"attempt={attempts_used + 1}/{self.tokentrim_rollback_max_attempts}",
                     )
                     tokentrim_rollback_attempts[window_index] = attempts_used + 1
-                    target_start_frame = target_history["start_frame"]
-                    output[:, target_start_frame:] = target_history["output_tail"]
-                    noisy_cache[:, target_start_frame:] = target_history["noisy_cache_tail"]
-                    self.tokentrim_state = copy.deepcopy(target_history["state"])
-                    self.tokentrim_prev_summary = (
-                        None if target_history["prev_summary"] is None else target_history["prev_summary"].detach().clone()
-                    )
-                    self.tokentrim_prev_start_frame = target_history["prev_start_frame"]
-                    self._rebuild_clean_cache_from_output(
-                        output=output,
-                        conditional_dict=conditional_dict,
-                        window_start_blocks=window_start_blocks,
-                        up_to_window_index=target_window_index,
-                    )
                     if self.tokentrim_last_token_indices is not None:
-                        self._tokentrim_suppress_cache(
-                            self.kv_cache_clean,
-                            self.tokentrim_last_token_indices,
-                            frame_seq_length=self.frame_seq_length,
-                            block_length=self.num_frame_per_block * self.frame_seq_length,
-                            sink_blocks=self.tokentrim_sink_blocks,
-                        )
-                    window_index = target_window_index
+                        tokentrim_rollback_suppressions[target_window_index] = self.tokentrim_last_token_indices.detach()
+                    output.zero_()
+                    noisy_cache.zero_()
+                    self._reset_clean_cache(noise.device)
+                    self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
+                    self.tokentrim_prev_summary = None
+                    self.tokentrim_prev_start_frame = None
+                    if initial_cuda_rng_state is not None:
+                        torch.set_rng_state(initial_cpu_rng_state)
+                        torch.cuda.set_rng_state(initial_cuda_rng_state, noise.device)
+                    else:
+                        torch.set_rng_state(initial_cpu_rng_state)
+                    window_index = 0
                     continue
 
             output[:, current_start_frame:current_end_frame] = denoised_pred
