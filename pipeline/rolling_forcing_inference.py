@@ -659,7 +659,6 @@ class CausalInferencePipeline(torch.nn.Module):
                     and self.tokentrim_rollback_windows > 0
                     and self.tokentrim_rollback_max_attempts > 0
                     and tokentrim_active_candidate is None
-                    and not tokentrim_candidate_recorded
                     and self.tokentrim_last_pruned
             ):
                 attempts_used = tokentrim_rollback_attempts.get(window_index, 0)
