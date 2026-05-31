@@ -39,6 +39,24 @@ pip install -r requirements.txt
 pip install flash-attn --no-build-isolation
 ```
 
+### Vast / Python 3.12 experiment setup
+For short-lived Vast instances, use the scripted setup instead of installing
+`requirements.txt` directly. It creates a RollingForcing env, optionally creates
+a separate VBench env, downloads checkpoints, and writes the 1.3B experiment
+configs used by the TokenTrim rollback experiments.
+
+```
+bash scripts/setup_vast_env.sh
+```
+
+Useful toggles:
+
+```
+DOWNLOAD_CHECKPOINTS=0 bash scripts/setup_vast_env.sh
+INSTALL_VBENCH=0 bash scripts/setup_vast_env.sh
+INSTALL_FLASH_ATTN=0 PATCH_SDPA_FALLBACK=1 bash scripts/setup_vast_env.sh
+```
+
 ## 🚀 Quick Start
 ### Download checkpoints
 ```
