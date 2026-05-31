@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import List, Optional
 import copy
 import gc
@@ -17,8 +18,15 @@ class CausalInferencePipeline(torch.nn.Module):
     ):
         super().__init__()
         # Step 1: Initialize all models
+        model_kwargs = getattr(args, "model_kwargs", {}) or {}
+        if not isinstance(model_kwargs, Mapping):
+            raise TypeError(
+                "model_kwargs must be a mapping. Check YAML indentation near "
+                "`model_kwargs:`; expected entries like `  timestep_shift: 5.0`, "
+                f"got {type(model_kwargs).__name__}."
+            )
         self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
+            **model_kwargs, is_causal=True) if generator is None else generator
         self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
         self.vae = WanVAEWrapper() if vae is None else vae
 
@@ -722,6 +730,7 @@ class CausalInferencePipeline(torch.nn.Module):
                             ):
                                 tokentrim_rollback_suppressions[best_candidate["target_window_index"]] = best_candidate["token_indices"]
                             if restore_checkpoint is not None:
+                                replay_start_window = restore_checkpoint["next_window_index"]
                                 window_index = self._restore_tokentrim_checkpoint(
                                     restore_checkpoint,
                                     output,
@@ -730,6 +739,7 @@ class CausalInferencePipeline(torch.nn.Module):
                                     cuda_rng_state=best_candidate["cuda_rng_state"],
                                 )
                             else:
+                                replay_start_window = 0
                                 output.zero_()
                                 noisy_cache.zero_()
                                 self._reset_clean_cache(noise.device)
@@ -740,7 +750,11 @@ class CausalInferencePipeline(torch.nn.Module):
                                 if best_candidate["cuda_rng_state"] is not None:
                                     torch.cuda.set_rng_state(best_candidate["cuda_rng_state"], noise.device)
                                 window_index = 0
-                            tokentrim_finalizing_windows.add(failed_window_index)
+                            for finalizing_window in range(replay_start_window, failed_window_index + 1):
+                                tokentrim_rollback_attempts.pop(finalizing_window, None)
+                                tokentrim_rollback_candidates.pop(finalizing_window, None)
+                                tokentrim_rollback_queues.pop(finalizing_window, None)
+                                tokentrim_finalizing_windows.add(finalizing_window)
                             continue
                     else:
                         candidate_spec = candidate_queue[attempts_used]
