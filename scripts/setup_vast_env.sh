@@ -90,13 +90,16 @@ if [[ "$CREATE_VAST_CONFIGS" == "1" ]]; then
       > prompts/vast_eval_5prompts.txt
   fi
 
-  cp configs/rolling_forcing_dmd.yaml configs/vast_base_1_3b.yaml
-  perl -0pi -e 's/real_name: Wan2\.1-T2V-14B/real_name: Wan2.1-T2V-1.3B/' configs/vast_base_1_3b.yaml
-  perl -0pi -e 's#data_path: .*#data_path: prompts/vast_eval_5prompts.txt#' configs/vast_base_1_3b.yaml
+  if [[ ! -f configs/vast_base_1_3b.yaml ]]; then
+    cp configs/rolling_forcing_dmd.yaml configs/vast_base_1_3b.yaml
+    perl -0pi -e 's/real_name: Wan2\.1-T2V-14B/real_name: Wan2.1-T2V-1.3B/' configs/vast_base_1_3b.yaml
+    perl -0pi -e 's#data_path: .*#data_path: prompts/vast_eval_5prompts.txt#' configs/vast_base_1_3b.yaml
+  fi
 
-  cp configs/vast_base_1_3b.yaml configs/vast_tokentrim_baseline_1_3b.yaml
-  printf '\n' >> configs/vast_tokentrim_baseline_1_3b.yaml
-  cat >> configs/vast_tokentrim_baseline_1_3b.yaml <<'EOF'
+  if [[ ! -f configs/vast_tokentrim_baseline_1_3b.yaml ]]; then
+    cp configs/vast_base_1_3b.yaml configs/vast_tokentrim_baseline_1_3b.yaml
+    printf '\n' >> configs/vast_tokentrim_baseline_1_3b.yaml
+    cat >> configs/vast_tokentrim_baseline_1_3b.yaml <<'EOF'
 tokentrim_enabled: true
 tokentrim_pruning_fraction: 0.30
 tokentrim_lambda_threshold: 0.5
@@ -105,10 +108,12 @@ tokentrim_sink_blocks: 1
 tokentrim_max_rerolls: 1
 tokentrim_debug: true
 EOF
+  fi
 
-  cp configs/vast_base_1_3b.yaml configs/vast_tokentrim_rollback2_suppress_1_3b.yaml
-  printf '\n' >> configs/vast_tokentrim_rollback2_suppress_1_3b.yaml
-  cat >> configs/vast_tokentrim_rollback2_suppress_1_3b.yaml <<'EOF'
+  if [[ ! -f configs/vast_tokentrim_rollback2_suppress_1_3b.yaml ]]; then
+    cp configs/vast_base_1_3b.yaml configs/vast_tokentrim_rollback2_suppress_1_3b.yaml
+    printf '\n' >> configs/vast_tokentrim_rollback2_suppress_1_3b.yaml
+    cat >> configs/vast_tokentrim_rollback2_suppress_1_3b.yaml <<'EOF'
 tokentrim_enabled: true
 tokentrim_pruning_fraction: 0.30
 tokentrim_lambda_threshold: 0.5
@@ -135,6 +140,7 @@ tokentrim_rollback_interventions:
   - suppress
 tokentrim_rollback_best_of_n: 1
 EOF
+  fi
 fi
 
 if [[ "$INSTALL_VBENCH" == "1" ]]; then
