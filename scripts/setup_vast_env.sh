@@ -95,6 +95,7 @@ if [[ "$CREATE_VAST_CONFIGS" == "1" ]]; then
   perl -0pi -e 's#data_path: .*#data_path: prompts/vast_eval_5prompts.txt#' configs/vast_base_1_3b.yaml
 
   cp configs/vast_base_1_3b.yaml configs/vast_tokentrim_baseline_1_3b.yaml
+  printf '\n' >> configs/vast_tokentrim_baseline_1_3b.yaml
   cat >> configs/vast_tokentrim_baseline_1_3b.yaml <<'EOF'
 tokentrim_enabled: true
 tokentrim_pruning_fraction: 0.30
@@ -106,6 +107,7 @@ tokentrim_debug: true
 EOF
 
   cp configs/vast_base_1_3b.yaml configs/vast_tokentrim_rollback2_suppress_1_3b.yaml
+  printf '\n' >> configs/vast_tokentrim_rollback2_suppress_1_3b.yaml
   cat >> configs/vast_tokentrim_rollback2_suppress_1_3b.yaml <<'EOF'
 tokentrim_enabled: true
 tokentrim_pruning_fraction: 0.30
