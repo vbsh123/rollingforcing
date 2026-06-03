@@ -141,6 +141,51 @@ tokentrim_rollback_interventions:
 tokentrim_rollback_best_of_n: 1
 EOF
   fi
+
+  if [[ ! -f configs/vast_tokentrim_rollback_softsearch_1_3b.yaml ]]; then
+    cp configs/vast_base_1_3b.yaml configs/vast_tokentrim_rollback_softsearch_1_3b.yaml
+    printf '\n' >> configs/vast_tokentrim_rollback_softsearch_1_3b.yaml
+    cat >> configs/vast_tokentrim_rollback_softsearch_1_3b.yaml <<'EOF'
+tokentrim_enabled: true
+tokentrim_pruning_fraction: 0.15
+tokentrim_lambda_threshold: 0.5
+tokentrim_warmup_steps: 0
+tokentrim_sink_blocks: 1
+tokentrim_max_rerolls: 0
+tokentrim_debug: true
+tokentrim_trigger_mode: rate_anomaly
+
+tokentrim_rollback_windows: 2
+tokentrim_rollback_max_attempts: 4
+tokentrim_rollback_experimental: true
+tokentrim_rollback_suppress_cache: false
+tokentrim_rollback_reset_rng: false
+tokentrim_rollback_include_original: true
+tokentrim_rollback_selector: rate_anomaly
+tokentrim_selector_subject_weight: 1.0
+tokentrim_selector_boundary_weight: 1.0
+tokentrim_selector_motion_weight: 0.5
+tokentrim_selector_drift_weight: 0.05
+tokentrim_selector_rate_weight: 1.0
+tokentrim_selector_context_frames: 6
+tokentrim_rate_history_size: 8
+tokentrim_rate_warmup_steps: 3
+tokentrim_rate_z_threshold: 2.0
+tokentrim_rate_top_fraction: 0.10
+
+tokentrim_checkpoint_count: 2
+tokentrim_checkpoint_device: cpu
+tokentrim_checkpoint_interval: 1
+
+tokentrim_rollback_depths:
+  - 1
+  - 2
+tokentrim_rollback_interventions:
+  - none
+  - soft_suppress:0.8
+tokentrim_rollback_best_of_n: 1
+EOF
+  fi
 fi
 
 if [[ "$INSTALL_VBENCH" == "1" ]]; then

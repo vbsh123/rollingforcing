@@ -42,6 +42,7 @@ def suppress_rolling_forcing_cache_tokens(
     block_length: int | None = None,
     sink_blocks: int = 1,
     value: float = 0.0,
+    scale: float | None = None,
 ) -> None:
     """Suppress selected spatial tokens in RollingForcing's working KV cache.
 
@@ -84,5 +85,9 @@ def suppress_rolling_forcing_cache_tokens(
         if positions.numel() == 0:
             continue
 
-        layer_cache["k"][:, positions] = value
-        layer_cache["v"][:, positions] = value
+        if scale is None:
+            layer_cache["k"][:, positions] = value
+            layer_cache["v"][:, positions] = value
+        else:
+            layer_cache["k"][:, positions] *= scale
+            layer_cache["v"][:, positions] *= scale

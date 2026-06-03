@@ -54,8 +54,10 @@ class CausalInferencePipeline(torch.nn.Module):
 
         self.tokentrim_enabled = bool(getattr(args, "tokentrim_enabled", False))
         self.tokentrim_state = None
+        self.tokentrim_rate_history = []
         self.tokentrim_prev_summary = None
         self.tokentrim_prev_start_frame = None
+        self.tokentrim_trigger_mode = "tokentrim"
         self.tokentrim_rollback_windows = 0
         self.tokentrim_rollback_max_attempts = 0
         self.tokentrim_rollback_experimental = False
@@ -64,6 +66,18 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_rollback_best_of_n = 1
         self.tokentrim_rollback_depths = None
         self.tokentrim_rollback_interventions = ["none"]
+        self.tokentrim_rollback_include_original = False
+        self.tokentrim_rollback_selector = "drift"
+        self.tokentrim_selector_subject_weight = 1.0
+        self.tokentrim_selector_boundary_weight = 1.0
+        self.tokentrim_selector_motion_weight = 0.5
+        self.tokentrim_selector_drift_weight = 0.05
+        self.tokentrim_selector_rate_weight = 1.0
+        self.tokentrim_selector_context_frames = 6
+        self.tokentrim_rate_history_size = 8
+        self.tokentrim_rate_warmup_steps = 3
+        self.tokentrim_rate_z_threshold = 2.0
+        self.tokentrim_rate_top_fraction = 0.10
         self.tokentrim_checkpoint_count = 0
         self.tokentrim_checkpoint_interval = 1
         self.tokentrim_checkpoint_device = "cpu"
@@ -71,6 +85,9 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_last_token_indices = None
         self.tokentrim_last_severity = None
         self.tokentrim_last_threshold = None
+        self.tokentrim_last_drift = None
+        self.tokentrim_last_rate_score = None
+        self.tokentrim_last_rate_components = None
         if self.tokentrim_enabled:
             try:
                 from tokentrim import TokenTrimConfig, TokenTrimState
@@ -93,6 +110,13 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_max_rerolls = int(getattr(args, "tokentrim_max_rerolls", 1))
             self.tokentrim_debug = bool(getattr(args, "tokentrim_debug", False))
             self.tokentrim_patch_size = tuple(getattr(args, "tokentrim_patch_size", [2, 2]))
+            self.tokentrim_trigger_mode = str(getattr(args, "tokentrim_trigger_mode", "tokentrim"))
+            valid_triggers = {"tokentrim", "rate_anomaly"}
+            if self.tokentrim_trigger_mode not in valid_triggers:
+                raise ValueError(
+                    "tokentrim_trigger_mode must be one of "
+                    f"{sorted(valid_triggers)}, got {self.tokentrim_trigger_mode!r}"
+                )
             self.tokentrim_rollback_windows = int(getattr(args, "tokentrim_rollback_windows", 0))
             self.tokentrim_rollback_max_attempts = int(getattr(args, "tokentrim_rollback_max_attempts", 0))
             self.tokentrim_rollback_experimental = bool(getattr(args, "tokentrim_rollback_experimental", False))
@@ -107,6 +131,53 @@ class CausalInferencePipeline(torch.nn.Module):
             )
             rollback_interventions = getattr(args, "tokentrim_rollback_interventions", ["none"])
             self.tokentrim_rollback_interventions = [str(item) for item in rollback_interventions]
+            self.tokentrim_rollback_include_original = bool(
+                getattr(args, "tokentrim_rollback_include_original", False)
+            )
+            self.tokentrim_rollback_selector = str(
+                getattr(args, "tokentrim_rollback_selector", "drift")
+            )
+            valid_selectors = {"drift", "latent_temporal", "rate_anomaly"}
+            if self.tokentrim_rollback_selector not in valid_selectors:
+                raise ValueError(
+                    "tokentrim_rollback_selector must be one of "
+                    f"{sorted(valid_selectors)}, got {self.tokentrim_rollback_selector!r}"
+                )
+            self.tokentrim_selector_subject_weight = float(
+                getattr(args, "tokentrim_selector_subject_weight", 1.0)
+            )
+            self.tokentrim_selector_boundary_weight = float(
+                getattr(args, "tokentrim_selector_boundary_weight", 1.0)
+            )
+            self.tokentrim_selector_motion_weight = float(
+                getattr(args, "tokentrim_selector_motion_weight", 0.5)
+            )
+            self.tokentrim_selector_drift_weight = float(
+                getattr(args, "tokentrim_selector_drift_weight", 0.05)
+            )
+            self.tokentrim_selector_rate_weight = float(
+                getattr(args, "tokentrim_selector_rate_weight", 1.0)
+            )
+            self.tokentrim_selector_context_frames = max(
+                1,
+                int(getattr(args, "tokentrim_selector_context_frames", 6)),
+            )
+            self.tokentrim_rate_history_size = max(
+                1,
+                int(getattr(args, "tokentrim_rate_history_size", 8)),
+            )
+            self.tokentrim_rate_warmup_steps = max(
+                1,
+                int(getattr(args, "tokentrim_rate_warmup_steps", 3)),
+            )
+            self.tokentrim_rate_z_threshold = float(
+                getattr(args, "tokentrim_rate_z_threshold", 2.0)
+            )
+            self.tokentrim_rate_top_fraction = float(
+                getattr(args, "tokentrim_rate_top_fraction", self.tokentrim_config.pruning_fraction)
+            )
+            if not 0.0 < self.tokentrim_rate_top_fraction < 1.0:
+                raise ValueError("tokentrim_rate_top_fraction must be in (0, 1)")
             self.tokentrim_checkpoint_count = int(getattr(args, "tokentrim_checkpoint_count", 0))
             self.tokentrim_checkpoint_interval = max(1, int(getattr(args, "tokentrim_checkpoint_interval", 1)))
             self.tokentrim_checkpoint_device = str(getattr(args, "tokentrim_checkpoint_device", "cpu"))
@@ -171,6 +242,10 @@ class CausalInferencePipeline(torch.nn.Module):
             "kv_cache": self._cache_to_device(self.kv_cache_clean, checkpoint_device),
             "crossattn_cache": self._cache_to_device(self.crossattn_cache, checkpoint_device),
             "tokentrim_state": copy.deepcopy(self.tokentrim_state),
+            "rate_history": [
+                drift.detach().to(device=checkpoint_device, copy=True)
+                for drift in self.tokentrim_rate_history
+            ],
             "prev_summary": (
                 None if prev_summary is None else prev_summary.detach().to(device=checkpoint_device, copy=True)
             ),
@@ -190,6 +265,10 @@ class CausalInferencePipeline(torch.nn.Module):
         self._restore_cache_from_device(self.kv_cache_clean, checkpoint["kv_cache"])
         self._restore_cache_from_device(self.crossattn_cache, checkpoint["crossattn_cache"])
         self.tokentrim_state = copy.deepcopy(checkpoint["tokentrim_state"])
+        self.tokentrim_rate_history = [
+            drift.to(device=output.device, copy=True)
+            for drift in checkpoint.get("rate_history", [])
+        ]
         self.tokentrim_prev_summary = (
             None if checkpoint["prev_summary"] is None
             else checkpoint["prev_summary"].to(device=output.device)
@@ -248,6 +327,166 @@ class CausalInferencePipeline(torch.nn.Module):
                 })
         return specs
 
+    @staticmethod
+    def _parse_tokentrim_rollback_intervention(intervention):
+        if intervention == "none":
+            return "none", None
+        if intervention == "suppress":
+            return "suppress", None
+        for prefix in ("soft_suppress:", "soft:", "scale:"):
+            if intervention.startswith(prefix):
+                scale = float(intervention.split(":", 1)[1])
+                if not 0.0 <= scale <= 1.0:
+                    raise ValueError(f"soft suppression scale must be in [0, 1], got {scale}")
+                return "soft_suppress", scale
+        raise ValueError(
+            "Unknown TokenTrim rollback intervention "
+            f"{intervention!r}; expected none, suppress, or soft_suppress:<scale>."
+        )
+
+    @staticmethod
+    def _latent_frame_embeddings(latents):
+        embeddings = latents.float().mean(dim=(-1, -2))
+        return torch.nn.functional.normalize(embeddings, dim=-1, eps=1e-6)
+
+    @staticmethod
+    def _format_tokentrim_selector_components(components):
+        if not components:
+            return "selector_components=none"
+        return "selector_components=" + ",".join(
+            f"{key}:{value:.4f}" for key, value in sorted(components.items())
+        )
+
+    def _transition_rate_signal(self, drift):
+        drift = drift.detach()
+        components = {
+            "rate": 0.0,
+            "rate_mean": 0.0,
+            "rate_std": 0.0,
+            "rate_z": 0.0,
+        }
+        if len(self.tokentrim_rate_history) < self.tokentrim_rate_warmup_steps:
+            return 0.0, False, components
+
+        history = torch.stack([
+            item.to(device=drift.device, dtype=drift.dtype)
+            for item in self.tokentrim_rate_history[-self.tokentrim_rate_history_size:]
+        ], dim=0)
+        expected_mean = history.mean(dim=0)
+        expected_std = history.std(dim=0, unbiased=False).clamp_min(self.tokentrim_config.eps)
+        z_scores = (drift - expected_mean) / expected_std
+
+        token_count = z_scores.shape[-1]
+        top_k = max(1, int(token_count * self.tokentrim_rate_top_fraction))
+        top_z = torch.topk(z_scores, k=top_k, dim=-1, largest=True, sorted=False).values
+        rate_score = top_z.mean()
+
+        components["rate"] = float(drift.mean().detach().cpu().item())
+        components["rate_mean"] = float(expected_mean.mean().detach().cpu().item())
+        components["rate_std"] = float(expected_std.mean().detach().cpu().item())
+        components["rate_z"] = float(rate_score.detach().cpu().item())
+        return components["rate_z"], components["rate_z"] > self.tokentrim_rate_z_threshold, components
+
+    def _score_transition_rate_candidate(self, candidate_drift):
+        if len(self.tokentrim_rate_history) < self.tokentrim_rate_warmup_steps:
+            rate_z, _, components = self._transition_rate_signal(candidate_drift)
+            return abs(rate_z), components
+
+        drift = candidate_drift.detach()
+        history = torch.stack([
+            item.to(device=drift.device, dtype=drift.dtype)
+            for item in self.tokentrim_rate_history[-self.tokentrim_rate_history_size:]
+        ], dim=0)
+        expected_mean = history.mean(dim=0)
+        expected_std = history.std(dim=0, unbiased=False).clamp_min(self.tokentrim_config.eps)
+        normalized_error = torch.abs(drift - expected_mean) / expected_std
+
+        token_count = normalized_error.shape[-1]
+        top_k = max(1, int(token_count * self.tokentrim_rate_top_fraction))
+        top_error = torch.topk(normalized_error, k=top_k, dim=-1, largest=True, sorted=False).values
+        score = top_error.mean()
+
+        components = {
+            "rate": float(drift.mean().detach().cpu().item()),
+            "rate_mean": float(expected_mean.mean().detach().cpu().item()),
+            "rate_std": float(expected_std.mean().detach().cpu().item()),
+            "rate_error": float(score.detach().cpu().item()),
+        }
+        return components["rate_error"], components
+
+    def _accept_transition_rate(self, drift):
+        if drift is None:
+            return
+        self.tokentrim_rate_history.append(drift.detach())
+        if len(self.tokentrim_rate_history) > self.tokentrim_rate_history_size:
+            self.tokentrim_rate_history = self.tokentrim_rate_history[-self.tokentrim_rate_history_size:]
+
+    def _score_tokentrim_candidate(
+            self,
+            output,
+            denoised_pred,
+            current_start_frame,
+            current_end_frame,
+            severity,
+            drift=None,
+    ):
+        if self.tokentrim_rollback_selector == "drift":
+            return float(severity), {"drift": float(severity)}
+
+        if self.tokentrim_rollback_selector == "rate_anomaly":
+            if drift is None:
+                return float(severity), {"drift": float(severity)}
+            rate_score, rate_components = self._score_transition_rate_candidate(drift)
+            rate_components["drift"] = float(severity)
+            score = (
+                self.tokentrim_selector_rate_weight * rate_score
+                + self.tokentrim_selector_drift_weight * float(severity)
+            )
+            return float(score), rate_components
+
+        candidate_frames = denoised_pred[:, :current_end_frame - current_start_frame]
+        context_start_frame = max(0, current_start_frame - self.tokentrim_selector_context_frames)
+        context = output[:, context_start_frame:current_start_frame]
+
+        with torch.no_grad():
+            candidate_embeddings = self._latent_frame_embeddings(candidate_frames)[0]
+            components = {"drift": float(severity)}
+
+            if context.shape[1] > 0:
+                context_embeddings = self._latent_frame_embeddings(context)[0]
+                reference_embedding = context_embeddings.mean(dim=0, keepdim=True)
+                reference_embedding = torch.nn.functional.normalize(reference_embedding, dim=-1, eps=1e-6)
+                subject_cost = 1.0 - (
+                    candidate_embeddings * reference_embedding
+                ).sum(dim=-1).mean()
+                boundary_cost = 1.0 - (
+                    context_embeddings[-1] * candidate_embeddings[0]
+                ).sum()
+                combined_embeddings = torch.cat([context_embeddings[-1:], candidate_embeddings], dim=0)
+            else:
+                subject_cost = candidate_embeddings.new_tensor(0.0)
+                boundary_cost = candidate_embeddings.new_tensor(0.0)
+                combined_embeddings = candidate_embeddings
+
+            if combined_embeddings.shape[0] > 1:
+                motion_cost = 1.0 - (
+                    combined_embeddings[1:] * combined_embeddings[:-1]
+                ).sum(dim=-1).mean()
+            else:
+                motion_cost = candidate_embeddings.new_tensor(0.0)
+
+            components["subject"] = float(subject_cost.item())
+            components["boundary"] = float(boundary_cost.item())
+            components["motion"] = float(motion_cost.item())
+
+            score = (
+                self.tokentrim_selector_subject_weight * components["subject"]
+                + self.tokentrim_selector_boundary_weight * components["boundary"]
+                + self.tokentrim_selector_motion_weight * components["motion"]
+                + self.tokentrim_selector_drift_weight * components["drift"]
+            )
+            return float(score), components
+
     def _reset_clean_cache(self, device):
         for layer_cache in self.crossattn_cache:
             layer_cache["is_init"] = False
@@ -304,6 +543,9 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_last_token_indices = None
         self.tokentrim_last_severity = None
         self.tokentrim_last_threshold = None
+        self.tokentrim_last_drift = None
+        self.tokentrim_last_rate_score = None
+        self.tokentrim_last_rate_components = None
         if denoised_pred.shape[0] != 1:
             raise ValueError("The current TokenTrim integration supports batch_size=1 / num_samples=1")
 
@@ -339,6 +581,21 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_last_token_indices = result.token_indices.detach()
         self.tokentrim_last_severity = result.severity
         self.tokentrim_last_threshold = result.threshold
+        self.tokentrim_last_drift = result.drift.detach()
+        rate_score, rate_should_prune, rate_components = self._transition_rate_signal(result.drift)
+        self.tokentrim_last_rate_score = rate_score
+        self.tokentrim_last_rate_components = rate_components
+        if self.tokentrim_trigger_mode == "rate_anomaly":
+            self.tokentrim_last_pruned = rate_should_prune
+        if self.tokentrim_debug:
+            print(
+                "TokenTrim rate signal:",
+                f"trigger={self.tokentrim_trigger_mode}",
+                f"rate_z={rate_components['rate_z']:.4f}",
+                f"threshold={self.tokentrim_rate_z_threshold:.4f}",
+                f"history={len(self.tokentrim_rate_history)}",
+                f"decision={'prune_and_reroll' if self.tokentrim_last_pruned else 'accept'}",
+            )
 
         rerolls_remaining = self.tokentrim_max_rerolls
         while result.should_prune and rerolls_remaining > 0:
@@ -388,6 +645,12 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_last_token_indices = result.token_indices.detach()
         self.tokentrim_last_severity = result.severity
         self.tokentrim_last_threshold = result.threshold
+        self.tokentrim_last_drift = result.drift.detach()
+        rate_score, rate_should_prune, rate_components = self._transition_rate_signal(result.drift)
+        self.tokentrim_last_rate_score = rate_score
+        self.tokentrim_last_rate_components = rate_components
+        if self.tokentrim_trigger_mode == "rate_anomaly":
+            self.tokentrim_last_pruned = rate_should_prune
         self.tokentrim_state.accept(result)
         self.tokentrim_prev_summary = current_summary.detach()
         self.tokentrim_prev_start_frame = current_start_frame
@@ -420,6 +683,7 @@ class CausalInferencePipeline(torch.nn.Module):
         batch_size, num_frames, num_channels, height, width = noise.shape
         if self.tokentrim_enabled:
             self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
+            self.tokentrim_rate_history = []
             self.tokentrim_prev_summary = None
             self.tokentrim_prev_start_frame = None
 
@@ -603,20 +867,31 @@ class CausalInferencePipeline(torch.nn.Module):
 
 
             if self.tokentrim_enabled and window_index in tokentrim_rollback_suppressions:
+                suppression_spec = tokentrim_rollback_suppressions[window_index]
+                suppression_tokens = suppression_spec["token_indices"]
+                suppression_scale = suppression_spec.get("scale")
+                suppression_label = suppression_spec.get("intervention", "suppress")
                 print(
                     "TokenTrim rollback suppression:",
                     f"window={window_index}",
-                    f"tokens={tokentrim_rollback_suppressions[window_index].numel()}",
+                    f"tokens={suppression_tokens.numel()}",
+                    f"intervention={suppression_label}",
+                    f"scale={suppression_scale}",
                 )
                 self._tokentrim_suppress_cache(
                     self.kv_cache_clean,
-                    tokentrim_rollback_suppressions[window_index],
+                    suppression_tokens,
                     frame_seq_length=self.frame_seq_length,
                     block_length=self.num_frame_per_block * self.frame_seq_length,
                     sink_blocks=self.tokentrim_sink_blocks,
+                    scale=suppression_scale,
                 )
 
             # calling DiT
+            pregeneration_cpu_rng_state = torch.get_rng_state()
+            pregeneration_cuda_rng_state = (
+                torch.cuda.get_rng_state(noise.device) if noise.device.type == "cuda" else None
+            )
             tokentrim_cache_snapshot = (
                 self._clone_kv_cache(self.kv_cache_clean)
                 if self.tokentrim_enabled and self.tokentrim_max_rerolls > 0
@@ -648,6 +923,16 @@ class CausalInferencePipeline(torch.nn.Module):
             ):
                 tokentrim_active_candidate["severity"] = self.tokentrim_last_severity
                 tokentrim_active_candidate["pruned"] = self.tokentrim_last_pruned
+                selector_score, selector_components = self._score_tokentrim_candidate(
+                    output=output,
+                    denoised_pred=denoised_pred,
+                    current_start_frame=current_start_frame,
+                    current_end_frame=current_end_frame,
+                    severity=self.tokentrim_last_severity,
+                    drift=self.tokentrim_last_drift,
+                )
+                tokentrim_active_candidate["selector_score"] = selector_score
+                tokentrim_active_candidate["selector_components"] = selector_components
                 tokentrim_rollback_candidates.setdefault(window_index, []).append(tokentrim_active_candidate)
                 print(
                     "TokenTrim rollback candidate:",
@@ -655,7 +940,11 @@ class CausalInferencePipeline(torch.nn.Module):
                     f"candidate={len(tokentrim_rollback_candidates[window_index])}",
                     f"depth={tokentrim_active_candidate.get('depth')}",
                     f"intervention={tokentrim_active_candidate.get('intervention')}",
+                    f"scale={tokentrim_active_candidate.get('suppress_scale')}",
                     f"severity={self.tokentrim_last_severity:.4f}",
+                    f"selector={self.tokentrim_rollback_selector}",
+                    f"selector_score={selector_score:.4f}",
+                    self._format_tokentrim_selector_components(selector_components),
                     f"pruned={self.tokentrim_last_pruned}",
                 )
                 tokentrim_active_candidate = None
@@ -682,6 +971,49 @@ class CausalInferencePipeline(torch.nn.Module):
                     ]
                 candidate_queue = tokentrim_rollback_queues[window_index]
                 candidates = tokentrim_rollback_candidates.get(window_index, [])
+                if self.tokentrim_rollback_include_original and not any(
+                        candidate.get("intervention") == "original"
+                        for candidate in candidates
+                ):
+                    original_checkpoint = self._select_tokentrim_checkpoint(
+                        tokentrim_checkpoints,
+                        window_index,
+                    )
+                    selector_score, selector_components = self._score_tokentrim_candidate(
+                        output=output,
+                        denoised_pred=denoised_pred,
+                        current_start_frame=current_start_frame,
+                        current_end_frame=current_end_frame,
+                        severity=self.tokentrim_last_severity,
+                        drift=self.tokentrim_last_drift,
+                    )
+                    candidates.append({
+                        "window_index": window_index,
+                        "severity": self.tokentrim_last_severity,
+                        "pruned": self.tokentrim_last_pruned,
+                        "selector_score": selector_score,
+                        "selector_components": selector_components,
+                        "cpu_rng_state": pregeneration_cpu_rng_state,
+                        "cuda_rng_state": pregeneration_cuda_rng_state,
+                        "checkpoint": original_checkpoint,
+                        "depth": 0,
+                        "intervention": "original",
+                        "target_window_index": window_index,
+                        "token_indices": None,
+                    })
+                    tokentrim_rollback_candidates[window_index] = candidates
+                    print(
+                        "TokenTrim rollback candidate:",
+                        f"window={window_index}",
+                        f"candidate={len(candidates)}",
+                        "depth=0",
+                        "intervention=original",
+                        f"severity={self.tokentrim_last_severity:.4f}",
+                        f"selector={self.tokentrim_rollback_selector}",
+                        f"selector_score={selector_score:.4f}",
+                        self._format_tokentrim_selector_components(selector_components),
+                        f"pruned={self.tokentrim_last_pruned}",
+                    )
                 if initial_latent is not None:
                     print(
                         "TokenTrim rollback skipped:",
@@ -712,23 +1044,39 @@ class CausalInferencePipeline(torch.nn.Module):
                             output[:, current_start_frame:current_end_frame] = denoised_pred
                         else:
                             failed_window_index = window_index
-                            best_candidate = min(candidates, key=lambda candidate: candidate["severity"])
+                            best_candidate = min(
+                                candidates,
+                                key=lambda candidate: candidate.get(
+                                    "selector_score",
+                                    candidate["severity"],
+                                ),
+                            )
                             restore_checkpoint = best_candidate.get("checkpoint")
                             print(
                                 "TokenTrim rollback select:",
                                 f"window={window_index}",
                                 f"candidates={len(candidates)}",
                                 f"best_severity={best_candidate['severity']:.4f}",
+                                f"selector={self.tokentrim_rollback_selector}",
+                                f"best_score={best_candidate.get('selector_score', best_candidate['severity']):.4f}",
+                                self._format_tokentrim_selector_components(
+                                    best_candidate.get("selector_components", {})
+                                ),
                                 f"depth={best_candidate.get('depth')}",
                                 f"intervention={best_candidate.get('intervention')}",
+                                f"scale={best_candidate.get('suppress_scale')}",
                                 f"checkpoint_next={restore_checkpoint['next_window_index'] if restore_checkpoint else 0}",
                             )
                             tokentrim_rollback_suppressions.clear()
                             if (
-                                    best_candidate.get("intervention") == "suppress"
+                                    best_candidate.get("intervention") in {"suppress", "soft_suppress"}
                                     and best_candidate.get("token_indices") is not None
                             ):
-                                tokentrim_rollback_suppressions[best_candidate["target_window_index"]] = best_candidate["token_indices"]
+                                tokentrim_rollback_suppressions[best_candidate["target_window_index"]] = {
+                                    "token_indices": best_candidate["token_indices"],
+                                    "scale": best_candidate.get("suppress_scale"),
+                                    "intervention": best_candidate.get("intervention"),
+                                }
                             if restore_checkpoint is not None:
                                 replay_start_window = restore_checkpoint["next_window_index"]
                                 window_index = self._restore_tokentrim_checkpoint(
@@ -744,6 +1092,7 @@ class CausalInferencePipeline(torch.nn.Module):
                                 noisy_cache.zero_()
                                 self._reset_clean_cache(noise.device)
                                 self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
+                                self.tokentrim_rate_history = []
                                 self.tokentrim_prev_summary = None
                                 self.tokentrim_prev_start_frame = None
                                 torch.set_rng_state(best_candidate["cpu_rng_state"])
@@ -788,8 +1137,17 @@ class CausalInferencePipeline(torch.nn.Module):
                             "token_indices": candidate_spec["token_indices"],
                         }
                         tokentrim_rollback_suppressions.clear()
-                        if candidate_spec["intervention"] == "suppress" and candidate_spec["token_indices"] is not None:
-                            tokentrim_rollback_suppressions[target_window_index] = candidate_spec["token_indices"]
+                        intervention_kind, suppress_scale = self._parse_tokentrim_rollback_intervention(
+                            candidate_spec["intervention"]
+                        )
+                        tokentrim_active_candidate["intervention"] = intervention_kind
+                        tokentrim_active_candidate["suppress_scale"] = suppress_scale
+                        if intervention_kind in {"suppress", "soft_suppress"} and candidate_spec["token_indices"] is not None:
+                            tokentrim_rollback_suppressions[target_window_index] = {
+                                "token_indices": candidate_spec["token_indices"],
+                                "scale": suppress_scale,
+                                "intervention": intervention_kind,
+                            }
                         if restore_checkpoint is not None:
                             window_index = self._restore_tokentrim_checkpoint(
                                 restore_checkpoint,
@@ -803,6 +1161,7 @@ class CausalInferencePipeline(torch.nn.Module):
                             noisy_cache.zero_()
                             self._reset_clean_cache(noise.device)
                             self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
+                            self.tokentrim_rate_history = []
                             self.tokentrim_prev_summary = None
                             self.tokentrim_prev_start_frame = None
                             if self.tokentrim_rollback_reset_rng and initial_cpu_rng_state is not None:
@@ -813,6 +1172,8 @@ class CausalInferencePipeline(torch.nn.Module):
                         continue
 
             output[:, current_start_frame:current_end_frame] = denoised_pred
+            if self.tokentrim_enabled:
+                self._accept_transition_rate(self.tokentrim_last_drift)
                 
 
             # update noisy_cache, which is detached from the computation graph
