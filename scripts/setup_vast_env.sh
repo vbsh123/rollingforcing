@@ -182,6 +182,7 @@ tokentrim_rollback_depths:
   - 2
 tokentrim_rollback_interventions:
   - none
+  - rate_normalize:0.5
   - soft_suppress:0.8
 tokentrim_rollback_best_of_n: 1
 EOF
