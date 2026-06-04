@@ -1148,7 +1148,11 @@ class CausalInferencePipeline(torch.nn.Module):
                         "depth": 0,
                         "intervention": "original",
                         "target_window_index": window_index,
-                        "token_indices": None,
+                        "token_indices": (
+                            None
+                            if self.tokentrim_last_token_indices is None
+                            else self.tokentrim_last_token_indices.detach()
+                        ),
                     })
                     tokentrim_rollback_candidates[window_index] = candidates
                     print(
@@ -1201,11 +1205,19 @@ class CausalInferencePipeline(torch.nn.Module):
                                 ),
                             )
                             restore_checkpoint = best_candidate.get("checkpoint")
+                            best_intervention = best_candidate.get("intervention")
+                            best_depth = best_candidate.get("depth")
+                            winner_checkpoint = (
+                                "original"
+                                if best_intervention == "original"
+                                else f"rollback_minus_{best_depth}"
+                            )
                             print(
                                 "TokenTrim rollback select:",
                                 f"window={window_index}",
                                 f"candidates={len(candidates)}",
-                                f"winner={best_candidate.get('intervention')}",
+                                f"winner={best_intervention}",
+                                f"winner_checkpoint={winner_checkpoint}",
                                 f"best_severity={best_candidate['severity']:.4f}",
                                 f"selector={self.tokentrim_rollback_selector}",
                                 f"best_score={best_candidate.get('selector_score', best_candidate['severity']):.4f}",
@@ -1221,15 +1233,39 @@ class CausalInferencePipeline(torch.nn.Module):
                             tokentrim_rollback_suppressions.clear()
                             tokentrim_rollback_rate_normalizations.clear()
                             if (
-                                    best_candidate.get("intervention") in {"suppress", "soft_suppress"}
+                                    best_intervention == "original"
+                                    and best_candidate.get("token_indices") is not None
+                            ):
+                                original_normalize_strength = None
+                                for intervention in self.tokentrim_rollback_interventions:
+                                    intervention_kind, intervention_strength = self._parse_tokentrim_rollback_intervention(
+                                        intervention
+                                    )
+                                    if intervention_kind == "rate_normalize":
+                                        original_normalize_strength = intervention_strength
+                                        break
+                                if original_normalize_strength is not None:
+                                    tokentrim_rollback_rate_normalizations[best_candidate["target_window_index"]] = {
+                                        "strength": original_normalize_strength,
+                                        "token_indices": best_candidate.get("token_indices"),
+                                    }
+                                    print(
+                                        "TokenTrim rollback original fallback:",
+                                        "intervention=rate_normalize",
+                                        f"window={best_candidate['target_window_index']}",
+                                        f"strength={original_normalize_strength}",
+                                        f"tokens={best_candidate['token_indices'].numel()}",
+                                    )
+                            if (
+                                    best_intervention in {"suppress", "soft_suppress"}
                                     and best_candidate.get("token_indices") is not None
                             ):
                                 tokentrim_rollback_suppressions[best_candidate["target_window_index"]] = {
                                     "token_indices": best_candidate["token_indices"],
                                     "scale": best_candidate.get("suppress_scale"),
-                                    "intervention": best_candidate.get("intervention"),
+                                    "intervention": best_intervention,
                                 }
-                            if best_candidate.get("intervention") == "rate_normalize":
+                            if best_intervention == "rate_normalize":
                                 tokentrim_rollback_rate_normalizations[best_candidate["target_window_index"]] = {
                                     "strength": best_candidate.get("intervention_strength", 1.0),
                                     "token_indices": best_candidate.get("token_indices"),
