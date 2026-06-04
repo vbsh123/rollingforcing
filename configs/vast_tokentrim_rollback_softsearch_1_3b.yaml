@@ -67,7 +67,7 @@ tokentrim_selector_rate_weight: 1.0
 tokentrim_selector_context_frames: 6
 tokentrim_rate_history_size: 8
 tokentrim_rate_warmup_steps: 6
-tokentrim_rate_z_threshold: 6.0
+tokentrim_rate_z_threshold: 5.0
 tokentrim_rate_top_fraction: 0.10
 
 tokentrim_checkpoint_count: 2
