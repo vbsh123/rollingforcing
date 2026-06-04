@@ -295,20 +295,26 @@ class CausalInferencePipeline(torch.nn.Module):
     def _prune_tokentrim_checkpoints(self, checkpoints, current_window_index):
         if self.tokentrim_checkpoint_count <= 0:
             return []
-        max_depth = max(
-            self.tokentrim_rollback_depths
-            if self.tokentrim_rollback_depths
-            else [self.tokentrim_rollback_windows]
-        )
-        oldest_useful_window = max(0, current_window_index - max_depth - self.tokentrim_checkpoint_count)
-        useful = [
-            checkpoint
-            for checkpoint in checkpoints
-            if checkpoint["next_window_index"] >= oldest_useful_window
+        depths = self.tokentrim_rollback_depths or [self.tokentrim_rollback_windows]
+        next_window_index = current_window_index + 1
+        target_window_indices = [
+            max(0, next_window_index - depth)
+            for depth in depths
+            if depth > 0
         ]
-        max_stored = self.tokentrim_checkpoint_count + max_depth + 1
-        if len(useful) > max_stored:
-            useful = useful[-max_stored:]
+        useful = []
+        seen_next_windows = set()
+        for target_window_index in target_window_indices:
+            checkpoint = self._select_tokentrim_checkpoint(checkpoints, target_window_index)
+            if checkpoint is None:
+                continue
+            checkpoint_next_window = checkpoint["next_window_index"]
+            if checkpoint_next_window in seen_next_windows:
+                continue
+            useful.append(checkpoint)
+            seen_next_windows.add(checkpoint_next_window)
+        if len(useful) > self.tokentrim_checkpoint_count:
+            useful = useful[:self.tokentrim_checkpoint_count]
         return useful
 
     def _rollback_candidate_specs(self, failed_window_index, token_indices):
@@ -1114,45 +1120,56 @@ class CausalInferencePipeline(torch.nn.Module):
                         candidate.get("intervention") == "original"
                         for candidate in candidates
                 ):
-                    original_checkpoint = self._select_tokentrim_checkpoint(
-                        tokentrim_checkpoints,
-                        window_index,
+                    original_checkpoint = next(
+                        (
+                            checkpoint
+                            for checkpoint in tokentrim_checkpoints
+                            if checkpoint["next_window_index"] == window_index
+                        ),
+                        None,
                     )
-                    selector_score, selector_components = self._score_tokentrim_candidate(
-                        output=output,
-                        denoised_pred=denoised_pred,
-                        current_start_frame=current_start_frame,
-                        current_end_frame=current_end_frame,
-                        severity=self.tokentrim_last_severity,
-                        drift=self.tokentrim_last_drift,
-                    )
-                    candidates.append({
-                        "window_index": window_index,
-                        "severity": self.tokentrim_last_severity,
-                        "pruned": self.tokentrim_last_pruned,
-                        "selector_score": selector_score,
-                        "selector_components": selector_components,
-                        "cpu_rng_state": pregeneration_cpu_rng_state,
-                        "cuda_rng_state": pregeneration_cuda_rng_state,
-                        "checkpoint": original_checkpoint,
-                        "depth": 0,
-                        "intervention": "original",
-                        "target_window_index": window_index,
-                        "token_indices": None,
-                    })
-                    tokentrim_rollback_candidates[window_index] = candidates
-                    print(
-                        "TokenTrim rollback candidate:",
-                        f"window={window_index}",
-                        f"candidate={len(candidates)}",
-                        "depth=0",
-                        "intervention=original",
-                        f"severity={self.tokentrim_last_severity:.4f}",
-                        f"selector={self.tokentrim_rollback_selector}",
-                        f"selector_score={selector_score:.4f}",
-                        self._format_tokentrim_selector_components(selector_components),
-                        f"pruned={self.tokentrim_last_pruned}",
-                    )
+                    if original_checkpoint is None:
+                        print(
+                            "TokenTrim rollback skipped:",
+                            "reason=original_checkpoint_pruned",
+                            f"from_window={window_index}",
+                        )
+                    else:
+                        selector_score, selector_components = self._score_tokentrim_candidate(
+                            output=output,
+                            denoised_pred=denoised_pred,
+                            current_start_frame=current_start_frame,
+                            current_end_frame=current_end_frame,
+                            severity=self.tokentrim_last_severity,
+                            drift=self.tokentrim_last_drift,
+                        )
+                        candidates.append({
+                            "window_index": window_index,
+                            "severity": self.tokentrim_last_severity,
+                            "pruned": self.tokentrim_last_pruned,
+                            "selector_score": selector_score,
+                            "selector_components": selector_components,
+                            "cpu_rng_state": pregeneration_cpu_rng_state,
+                            "cuda_rng_state": pregeneration_cuda_rng_state,
+                            "checkpoint": original_checkpoint,
+                            "depth": 0,
+                            "intervention": "original",
+                            "target_window_index": window_index,
+                            "token_indices": None,
+                        })
+                        tokentrim_rollback_candidates[window_index] = candidates
+                        print(
+                            "TokenTrim rollback candidate:",
+                            f"window={window_index}",
+                            f"candidate={len(candidates)}",
+                            "depth=0",
+                            "intervention=original",
+                            f"severity={self.tokentrim_last_severity:.4f}",
+                            f"selector={self.tokentrim_rollback_selector}",
+                            f"selector_score={selector_score:.4f}",
+                            self._format_tokentrim_selector_components(selector_components),
+                            f"pruned={self.tokentrim_last_pruned}",
+                        )
                 if initial_latent is not None:
                     print(
                         "TokenTrim rollback skipped:",
