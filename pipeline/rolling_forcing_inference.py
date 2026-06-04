@@ -295,14 +295,37 @@ class CausalInferencePipeline(torch.nn.Module):
     def _prune_tokentrim_checkpoints(self, checkpoints, current_window_index):
         if self.tokentrim_checkpoint_count <= 0:
             return []
-        older_checkpoints = [
-            checkpoint
-            for checkpoint in checkpoints
-            if checkpoint["next_window_index"] <= current_window_index
+        depths = self.tokentrim_rollback_depths or [self.tokentrim_rollback_windows]
+        next_window_index = current_window_index + 1
+        target_window_indices = [
+            max(0, next_window_index - depth)
+            for depth in depths
+            if depth > 0
         ]
-        if len(older_checkpoints) >= self.tokentrim_checkpoint_count:
-            return older_checkpoints[-self.tokentrim_checkpoint_count:]
-        return checkpoints[-self.tokentrim_checkpoint_count:]
+        useful = []
+        seen_next_windows = set()
+        for target_window_index in target_window_indices:
+            checkpoint = self._select_tokentrim_checkpoint(checkpoints, target_window_index)
+            if checkpoint is None:
+                continue
+            checkpoint_next_window = checkpoint["next_window_index"]
+            if checkpoint_next_window in seen_next_windows:
+                continue
+            useful.append(checkpoint)
+            seen_next_windows.add(checkpoint_next_window)
+
+        latest_checkpoint = max(
+            checkpoints,
+            key=lambda checkpoint: checkpoint["next_window_index"],
+        )
+        latest_next_window = latest_checkpoint["next_window_index"]
+        if latest_next_window not in seen_next_windows:
+            useful.append(latest_checkpoint)
+
+        max_stored = self.tokentrim_checkpoint_count + 1
+        if len(useful) > max_stored:
+            useful = useful[-max_stored:]
+        return useful
 
     def _rollback_candidate_specs(self, failed_window_index, token_indices):
         depths = self.tokentrim_rollback_depths or [self.tokentrim_rollback_windows]
