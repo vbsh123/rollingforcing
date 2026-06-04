@@ -88,6 +88,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_last_drift = None
         self.tokentrim_last_rate_score = None
         self.tokentrim_last_rate_components = None
+        self.tokentrim_last_rate_token_indices = None
         if self.tokentrim_enabled:
             try:
                 from tokentrim import TokenTrimConfig, TokenTrimState
@@ -373,7 +374,7 @@ class CausalInferencePipeline(torch.nn.Module):
             "rate_z": 0.0,
         }
         if len(self.tokentrim_rate_history) < self.tokentrim_rate_warmup_steps:
-            return 0.0, False, components
+            return 0.0, False, components, None
 
         history = torch.stack([
             item.to(device=drift.device, dtype=drift.dtype)
@@ -385,18 +386,24 @@ class CausalInferencePipeline(torch.nn.Module):
 
         token_count = z_scores.shape[-1]
         top_k = max(1, int(token_count * self.tokentrim_rate_top_fraction))
-        top_z = torch.topk(z_scores, k=top_k, dim=-1, largest=True, sorted=False).values
+        top_rate = torch.topk(z_scores, k=top_k, dim=-1, largest=True, sorted=False)
+        top_z = top_rate.values
         rate_score = top_z.mean()
 
         components["rate"] = float(drift.mean().detach().cpu().item())
         components["rate_mean"] = float(expected_mean.mean().detach().cpu().item())
         components["rate_std"] = float(expected_std.mean().detach().cpu().item())
         components["rate_z"] = float(rate_score.detach().cpu().item())
-        return components["rate_z"], components["rate_z"] > self.tokentrim_rate_z_threshold, components
+        return (
+            components["rate_z"],
+            components["rate_z"] > self.tokentrim_rate_z_threshold,
+            components,
+            top_rate.indices.detach(),
+        )
 
     def _score_transition_rate_candidate(self, candidate_drift):
         if len(self.tokentrim_rate_history) < self.tokentrim_rate_warmup_steps:
-            rate_z, _, components = self._transition_rate_signal(candidate_drift)
+            rate_z, _, components, _ = self._transition_rate_signal(candidate_drift)
             return abs(rate_z), components
 
         drift = candidate_drift.detach()
@@ -442,6 +449,7 @@ class CausalInferencePipeline(torch.nn.Module):
             denoised_pred,
             current_start_frame,
             strength,
+            token_indices=None,
     ):
         if self.tokentrim_prev_summary is None:
             return denoised_pred, {"rate_normalized": 0.0}
@@ -460,6 +468,10 @@ class CausalInferencePipeline(torch.nn.Module):
         target_rate = expected_rate.to(device=observed_rate.device, dtype=observed_rate.dtype)
         shrink = (target_rate / observed_rate).clamp(max=1.0)
         token_scale = 1.0 - strength * (1.0 - shrink)
+        if token_indices is not None:
+            selected = torch.zeros_like(token_scale, dtype=torch.bool)
+            selected.scatter_(dim=-1, index=token_indices.to(device=selected.device), value=True)
+            token_scale = torch.where(selected, token_scale, torch.ones_like(token_scale))
 
         patch_h, patch_w = self.tokentrim_patch_size
         batch, frames, channels, height, width = candidate_block.shape
@@ -615,6 +627,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_last_drift = None
         self.tokentrim_last_rate_score = None
         self.tokentrim_last_rate_components = None
+        self.tokentrim_last_rate_token_indices = None
         if denoised_pred.shape[0] != 1:
             raise ValueError("The current TokenTrim integration supports batch_size=1 / num_samples=1")
 
@@ -651,11 +664,14 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_last_severity = result.severity
         self.tokentrim_last_threshold = result.threshold
         self.tokentrim_last_drift = result.drift.detach()
-        rate_score, rate_should_prune, rate_components = self._transition_rate_signal(result.drift)
+        rate_score, rate_should_prune, rate_components, rate_token_indices = self._transition_rate_signal(result.drift)
         self.tokentrim_last_rate_score = rate_score
         self.tokentrim_last_rate_components = rate_components
+        self.tokentrim_last_rate_token_indices = rate_token_indices
         if self.tokentrim_trigger_mode == "rate_anomaly":
             self.tokentrim_last_pruned = rate_should_prune
+            if rate_should_prune and rate_token_indices is not None:
+                self.tokentrim_last_token_indices = rate_token_indices.detach()
         if self.tokentrim_debug:
             print(
                 "TokenTrim rate signal:",
@@ -715,11 +731,14 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_last_severity = result.severity
         self.tokentrim_last_threshold = result.threshold
         self.tokentrim_last_drift = result.drift.detach()
-        rate_score, rate_should_prune, rate_components = self._transition_rate_signal(result.drift)
+        rate_score, rate_should_prune, rate_components, rate_token_indices = self._transition_rate_signal(result.drift)
         self.tokentrim_last_rate_score = rate_score
         self.tokentrim_last_rate_components = rate_components
+        self.tokentrim_last_rate_token_indices = rate_token_indices
         if self.tokentrim_trigger_mode == "rate_anomaly":
             self.tokentrim_last_pruned = rate_should_prune
+            if rate_should_prune and rate_token_indices is not None:
+                self.tokentrim_last_token_indices = rate_token_indices.detach()
         self.tokentrim_state.accept(result)
         self.tokentrim_prev_summary = current_summary.detach()
         self.tokentrim_prev_start_frame = current_start_frame
@@ -994,15 +1013,23 @@ class CausalInferencePipeline(torch.nn.Module):
                     and tokentrim_active_candidate.get("target_window_index") == window_index
                     else tokentrim_rollback_rate_normalizations[window_index]["strength"]
                 )
+                rate_normalize_tokens = (
+                    tokentrim_active_candidate.get("token_indices")
+                    if tokentrim_active_candidate is not None
+                    and tokentrim_active_candidate.get("target_window_index") == window_index
+                    else tokentrim_rollback_rate_normalizations[window_index].get("token_indices")
+                )
                 denoised_pred, tokentrim_rate_normalize_components = self._rate_normalize_candidate(
                     denoised_pred=denoised_pred,
                     current_start_frame=current_start_frame,
                     strength=rate_normalize_strength,
+                    token_indices=rate_normalize_tokens,
                 )
                 print(
                     "TokenTrim rollback rate_normalize:",
                     f"window={window_index}",
                     f"strength={rate_normalize_strength}",
+                    f"tokens={rate_normalize_tokens.numel() if rate_normalize_tokens is not None else 'all'}",
                     self._format_tokentrim_selector_components(tokentrim_rate_normalize_components),
                 )
 
@@ -1188,6 +1215,7 @@ class CausalInferencePipeline(torch.nn.Module):
                             if best_candidate.get("intervention") == "rate_normalize":
                                 tokentrim_rollback_rate_normalizations[best_candidate["target_window_index"]] = {
                                     "strength": best_candidate.get("intervention_strength", 1.0),
+                                    "token_indices": best_candidate.get("token_indices"),
                                 }
                             if restore_checkpoint is not None:
                                 replay_start_window = restore_checkpoint["next_window_index"]
