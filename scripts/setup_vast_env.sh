@@ -156,7 +156,7 @@ tokentrim_debug: true
 tokentrim_trigger_mode: rate_anomaly
 
 tokentrim_rollback_windows: 2
-tokentrim_rollback_max_attempts: 2
+tokentrim_rollback_max_attempts: 6
 tokentrim_rollback_experimental: true
 tokentrim_rollback_suppress_cache: false
 tokentrim_rollback_reset_rng: false
