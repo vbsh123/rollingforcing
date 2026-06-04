@@ -918,6 +918,7 @@ class CausalInferencePipeline(torch.nn.Module):
         tokentrim_active_candidate = None
         tokentrim_finalizing_windows = set()
         tokentrim_checkpoints = []
+        tokentrim_original_checkpoints = {}
         initial_cpu_rng_state = torch.get_rng_state() if self.tokentrim_rollback_reset_rng else None
         initial_cuda_rng_state = (
             torch.cuda.get_rng_state(noise.device)
@@ -1120,56 +1121,48 @@ class CausalInferencePipeline(torch.nn.Module):
                         candidate.get("intervention") == "original"
                         for candidate in candidates
                 ):
-                    original_checkpoint = next(
-                        (
-                            checkpoint
-                            for checkpoint in tokentrim_checkpoints
-                            if checkpoint["next_window_index"] == window_index
-                        ),
-                        None,
-                    )
-                    if original_checkpoint is None:
-                        print(
-                            "TokenTrim rollback skipped:",
-                            "reason=original_checkpoint_pruned",
-                            f"from_window={window_index}",
-                        )
-                    else:
-                        selector_score, selector_components = self._score_tokentrim_candidate(
+                    if window_index not in tokentrim_original_checkpoints:
+                        tokentrim_original_checkpoints[window_index] = self._make_tokentrim_checkpoint(
+                            next_window_index=window_index,
                             output=output,
-                            denoised_pred=denoised_pred,
-                            current_start_frame=current_start_frame,
-                            current_end_frame=current_end_frame,
-                            severity=self.tokentrim_last_severity,
-                            drift=self.tokentrim_last_drift,
+                            noisy_cache=noisy_cache,
                         )
-                        candidates.append({
-                            "window_index": window_index,
-                            "severity": self.tokentrim_last_severity,
-                            "pruned": self.tokentrim_last_pruned,
-                            "selector_score": selector_score,
-                            "selector_components": selector_components,
-                            "cpu_rng_state": pregeneration_cpu_rng_state,
-                            "cuda_rng_state": pregeneration_cuda_rng_state,
-                            "checkpoint": original_checkpoint,
-                            "depth": 0,
-                            "intervention": "original",
-                            "target_window_index": window_index,
-                            "token_indices": None,
-                        })
-                        tokentrim_rollback_candidates[window_index] = candidates
-                        print(
-                            "TokenTrim rollback candidate:",
-                            f"window={window_index}",
-                            f"candidate={len(candidates)}",
-                            "depth=0",
-                            "intervention=original",
-                            f"severity={self.tokentrim_last_severity:.4f}",
-                            f"selector={self.tokentrim_rollback_selector}",
-                            f"selector_score={selector_score:.4f}",
-                            self._format_tokentrim_selector_components(selector_components),
-                            f"pruned={self.tokentrim_last_pruned}",
-                        )
+                    original_checkpoint = tokentrim_original_checkpoints[window_index]
+                    selector_score, selector_components = self._score_tokentrim_candidate(
+                        output=output,
+                        denoised_pred=denoised_pred,
+                        current_start_frame=current_start_frame,
+                        current_end_frame=current_end_frame,
+                        severity=self.tokentrim_last_severity,
+                        drift=self.tokentrim_last_drift,
+                    )
+                    candidates.append({
+                        "window_index": window_index,
+                        "severity": self.tokentrim_last_severity,
+                        "pruned": self.tokentrim_last_pruned,
+                        "selector_score": selector_score,
+                        "selector_components": selector_components,
+                        "cpu_rng_state": pregeneration_cpu_rng_state,
+                        "cuda_rng_state": pregeneration_cuda_rng_state,
+                        "checkpoint": original_checkpoint,
+                        "depth": 0,
+                        "intervention": "original",
+                        "target_window_index": window_index,
+                        "token_indices": None,
+                    })
+                    tokentrim_rollback_candidates[window_index] = candidates
+                    print(
+                        "TokenTrim rollback candidate:",
+                        f"window={window_index}",
+                        f"candidate={len(candidates)}",
+                        "depth=0",
+                        "intervention=original",
+                        f"severity={self.tokentrim_last_severity:.4f}",
+                        f"selector={self.tokentrim_rollback_selector}",
+                        f"selector_score={selector_score:.4f}",
+                        self._format_tokentrim_selector_components(selector_components),
+                        f"pruned={self.tokentrim_last_pruned}",
+                    )
                 if initial_latent is not None:
                     print(
                         "TokenTrim rollback skipped:",
@@ -1212,6 +1205,7 @@ class CausalInferencePipeline(torch.nn.Module):
                                 "TokenTrim rollback select:",
                                 f"window={window_index}",
                                 f"candidates={len(candidates)}",
+                                f"winner={best_candidate.get('intervention')}",
                                 f"best_severity={best_candidate['severity']:.4f}",
                                 f"selector={self.tokentrim_rollback_selector}",
                                 f"best_score={best_candidate.get('selector_score', best_candidate['severity']):.4f}",
@@ -1266,6 +1260,7 @@ class CausalInferencePipeline(torch.nn.Module):
                                 tokentrim_rollback_attempts.pop(finalizing_window, None)
                                 tokentrim_rollback_candidates.pop(finalizing_window, None)
                                 tokentrim_rollback_queues.pop(finalizing_window, None)
+                                tokentrim_original_checkpoints.pop(finalizing_window, None)
                                 tokentrim_finalizing_windows.add(finalizing_window)
                             continue
                     else:
