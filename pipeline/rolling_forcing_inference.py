@@ -518,6 +518,56 @@ class CausalInferencePipeline(torch.nn.Module):
             "rate_norm_scale": float(token_scale.mean().detach().cpu().item()),
         }
 
+    def _rate_normalize_strengths(self):
+        strengths = []
+        for intervention in self.tokentrim_rollback_interventions:
+            intervention_kind, intervention_strength = self._parse_tokentrim_rollback_intervention(
+                intervention
+            )
+            if intervention_kind == "rate_normalize":
+                strengths.append(intervention_strength)
+        for fallback_strength in (0.5, 0.75, 1.0):
+            if fallback_strength not in strengths:
+                strengths.append(fallback_strength)
+        return strengths
+
+    def _estimate_rate_normalized_candidate(
+            self,
+            denoised_pred,
+            current_start_frame,
+            severity,
+            token_indices,
+            strength,
+    ):
+        repaired, normalize_components = self._rate_normalize_candidate(
+            denoised_pred=denoised_pred,
+            current_start_frame=current_start_frame,
+            strength=strength,
+            token_indices=token_indices,
+        )
+        candidate_block = repaired[:, :self.num_frame_per_block]
+        current_summary = self._tokentrim_latent_summary(
+            candidate_block,
+            patch_size=self.tokentrim_patch_size,
+        )
+        drift = torch.linalg.vector_norm(current_summary - self.tokentrim_prev_summary, ord=2, dim=-1)
+        rate_score, rate_should_prune, rate_components, rate_token_indices = self._transition_rate_signal(drift)
+        selector_components = dict(rate_components)
+        selector_components["drift"] = float(severity)
+        selector_score = (
+            self.tokentrim_selector_rate_weight * float(rate_score)
+            + self.tokentrim_selector_drift_weight * float(severity)
+        )
+        return {
+            "strength": strength,
+            "selector_score": float(selector_score),
+            "selector_components": selector_components,
+            "rate_components": rate_components,
+            "rate_normalize_components": normalize_components,
+            "pruned": rate_should_prune,
+            "token_indices": rate_token_indices.detach() if rate_token_indices is not None else token_indices,
+        }
+
     def _score_tokentrim_candidate(
             self,
             output,
@@ -1146,6 +1196,22 @@ class CausalInferencePipeline(torch.nn.Module):
                         severity=self.tokentrim_last_severity,
                         drift=self.tokentrim_last_drift,
                     )
+                    original_token_indices = (
+                        None
+                        if self.tokentrim_last_token_indices is None
+                        else self.tokentrim_last_token_indices.detach()
+                    )
+                    original_fallbacks = []
+                    if original_token_indices is not None:
+                        for normalize_strength in self._rate_normalize_strengths():
+                            fallback = self._estimate_rate_normalized_candidate(
+                                denoised_pred=denoised_pred,
+                                current_start_frame=current_start_frame,
+                                severity=self.tokentrim_last_severity,
+                                token_indices=original_token_indices,
+                                strength=normalize_strength,
+                            )
+                            original_fallbacks.append(fallback)
                     candidates.append({
                         "window_index": window_index,
                         "severity": self.tokentrim_last_severity,
@@ -1158,11 +1224,8 @@ class CausalInferencePipeline(torch.nn.Module):
                         "depth": 0,
                         "intervention": "original",
                         "target_window_index": window_index,
-                        "token_indices": (
-                            None
-                            if self.tokentrim_last_token_indices is None
-                            else self.tokentrim_last_token_indices.detach()
-                        ),
+                        "token_indices": original_token_indices,
+                        "original_fallbacks": original_fallbacks,
                     })
                     tokentrim_rollback_candidates[window_index] = candidates
                     print(
@@ -1207,13 +1270,45 @@ class CausalInferencePipeline(torch.nn.Module):
                             output[:, current_start_frame:current_end_frame] = denoised_pred
                         else:
                             failed_window_index = window_index
-                            best_candidate = min(
-                                candidates,
-                                key=lambda candidate: candidate.get(
-                                    "selector_score",
-                                    candidate["severity"],
+                            rollback_candidates = [
+                                candidate
+                                for candidate in candidates
+                                if candidate.get("intervention") != "original"
+                            ]
+                            non_pruned_rollback_candidates = [
+                                candidate
+                                for candidate in rollback_candidates
+                                if not candidate.get("pruned", True)
+                            ]
+                            original_candidate = next(
+                                (
+                                    candidate
+                                    for candidate in candidates
+                                    if candidate.get("intervention") == "original"
                                 ),
+                                None,
                             )
+                            if non_pruned_rollback_candidates:
+                                best_candidate = min(
+                                    non_pruned_rollback_candidates,
+                                    key=lambda candidate: candidate.get(
+                                        "selector_score",
+                                        candidate["severity"],
+                                    ),
+                                )
+                                selection_reason = "best_non_pruned_rollback"
+                            elif original_candidate is not None:
+                                best_candidate = original_candidate
+                                selection_reason = "original_adaptive_fallback"
+                            else:
+                                best_candidate = min(
+                                    candidates,
+                                    key=lambda candidate: candidate.get(
+                                        "selector_score",
+                                        candidate["severity"],
+                                    ),
+                                )
+                                selection_reason = "best_available_no_original"
                             restore_checkpoint = best_candidate.get("checkpoint")
                             best_intervention = best_candidate.get("intervention")
                             best_depth = best_candidate.get("depth")
@@ -1228,6 +1323,7 @@ class CausalInferencePipeline(torch.nn.Module):
                                 f"candidates={len(candidates)}",
                                 f"winner={best_intervention}",
                                 f"winner_checkpoint={winner_checkpoint}",
+                                f"reason={selection_reason}",
                                 f"best_severity={best_candidate['severity']:.4f}",
                                 f"selector={self.tokentrim_rollback_selector}",
                                 f"best_score={best_candidate.get('selector_score', best_candidate['severity']):.4f}",
@@ -1246,25 +1342,43 @@ class CausalInferencePipeline(torch.nn.Module):
                                     best_intervention == "original"
                                     and best_candidate.get("token_indices") is not None
                             ):
-                                original_normalize_strength = None
-                                for intervention in self.tokentrim_rollback_interventions:
-                                    intervention_kind, intervention_strength = self._parse_tokentrim_rollback_intervention(
-                                        intervention
+                                original_fallbacks = best_candidate.get("original_fallbacks", [])
+                                non_pruned_fallbacks = [
+                                    fallback
+                                    for fallback in original_fallbacks
+                                    if not fallback.get("pruned", True)
+                                ]
+                                if non_pruned_fallbacks:
+                                    original_fallback = min(
+                                        non_pruned_fallbacks,
+                                        key=lambda fallback: fallback["strength"],
                                     )
-                                    if intervention_kind == "rate_normalize":
-                                        original_normalize_strength = intervention_strength
-                                        break
-                                if original_normalize_strength is not None:
+                                elif original_fallbacks:
+                                    original_fallback = min(
+                                        original_fallbacks,
+                                        key=lambda fallback: fallback.get(
+                                            "selector_score",
+                                            float("inf"),
+                                        ),
+                                    )
+                                else:
+                                    original_fallback = None
+                                if original_fallback is not None:
                                     tokentrim_rollback_rate_normalizations[best_candidate["target_window_index"]] = {
-                                        "strength": original_normalize_strength,
+                                        "strength": original_fallback["strength"],
                                         "token_indices": best_candidate.get("token_indices"),
                                     }
                                     print(
                                         "TokenTrim rollback original fallback:",
                                         "intervention=rate_normalize",
                                         f"window={best_candidate['target_window_index']}",
-                                        f"strength={original_normalize_strength}",
+                                        f"strength={original_fallback['strength']}",
                                         f"tokens={best_candidate['token_indices'].numel()}",
+                                        f"fallback_pruned={original_fallback.get('pruned')}",
+                                        f"fallback_score={original_fallback.get('selector_score', 0.0):.4f}",
+                                        self._format_tokentrim_selector_components(
+                                            original_fallback.get("selector_components", {})
+                                        ),
                                     )
                             if (
                                     best_intervention in {"suppress", "soft_suppress"}
