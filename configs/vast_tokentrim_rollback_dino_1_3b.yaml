@@ -61,11 +61,12 @@ tokentrim_rollback_include_original: true
 tokentrim_rollback_selector: dino
 tokentrim_selector_drift_weight: 0.0
 tokentrim_selector_context_frames: 2
-tokentrim_dino_model_name: facebook/dinov2-small
+tokentrim_dino_model_name: vit_small_patch14_dinov2.lvd142m
 tokentrim_dino_device: cpu
 tokentrim_dino_subject_weight: 1.0
 tokentrim_dino_temporal_weight: 0.25
 tokentrim_dino_max_frames: 8
+tokentrim_dino_image_size: 518
 tokentrim_rate_history_size: 8
 tokentrim_rate_warmup_steps: 6
 tokentrim_rate_z_threshold: 5.0

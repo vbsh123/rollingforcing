@@ -74,11 +74,12 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_selector_drift_weight = 0.05
         self.tokentrim_selector_rate_weight = 1.0
         self.tokentrim_selector_context_frames = 6
-        self.tokentrim_dino_model_name = "facebook/dinov2-small"
+        self.tokentrim_dino_model_name = "vit_small_patch14_dinov2.lvd142m"
         self.tokentrim_dino_device = "cpu"
         self.tokentrim_dino_subject_weight = 1.0
         self.tokentrim_dino_temporal_weight = 0.25
         self.tokentrim_dino_max_frames = 8
+        self.tokentrim_dino_image_size = 518
         self._tokentrim_dino_model = None
         self.tokentrim_rate_history_size = 8
         self.tokentrim_rate_warmup_steps = 3
@@ -170,7 +171,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 int(getattr(args, "tokentrim_selector_context_frames", 6)),
             )
             self.tokentrim_dino_model_name = str(
-                getattr(args, "tokentrim_dino_model_name", "facebook/dinov2-small")
+                getattr(args, "tokentrim_dino_model_name", "vit_small_patch14_dinov2.lvd142m")
             )
             self.tokentrim_dino_device = str(getattr(args, "tokentrim_dino_device", "cpu"))
             self.tokentrim_dino_subject_weight = float(
@@ -182,6 +183,10 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_dino_max_frames = max(
                 1,
                 int(getattr(args, "tokentrim_dino_max_frames", 8)),
+            )
+            self.tokentrim_dino_image_size = max(
+                14,
+                int(getattr(args, "tokentrim_dino_image_size", 518)),
             )
             self.tokentrim_rate_history_size = max(
                 1,
@@ -590,15 +595,17 @@ class CausalInferencePipeline(torch.nn.Module):
 
     def _load_tokentrim_dino_model(self):
         if self._tokentrim_dino_model is None:
-            from transformers import AutoModel
+            import timm
 
             print(
                 "TokenTrim DINO load:",
                 f"model={self.tokentrim_dino_model_name}",
                 f"device={self.tokentrim_dino_device}",
             )
-            self._tokentrim_dino_model = AutoModel.from_pretrained(
-                self.tokentrim_dino_model_name
+            self._tokentrim_dino_model = timm.create_model(
+                self.tokentrim_dino_model_name,
+                pretrained=True,
+                num_classes=0,
             ).eval().requires_grad_(False).to(self.tokentrim_dino_device)
         return self._tokentrim_dino_model
 
@@ -615,7 +622,7 @@ class CausalInferencePipeline(torch.nn.Module):
             frames = frames.index_select(0, frame_indices)
         frames = torch.nn.functional.interpolate(
             frames.float(),
-            size=(224, 224),
+            size=(self.tokentrim_dino_image_size, self.tokentrim_dino_image_size),
             mode="bicubic",
             align_corners=False,
             antialias=True,
@@ -633,8 +640,7 @@ class CausalInferencePipeline(torch.nn.Module):
         )[None, :, None, None]
         frames = ((frames - mean) / std).to(self.tokentrim_dino_device)
         with torch.no_grad():
-            output = model(pixel_values=frames)
-        embeddings = output.pooler_output
+            embeddings = model(frames)
         return torch.nn.functional.normalize(embeddings.float(), dim=-1, eps=1e-6)
 
     def _score_dino_candidate(

@@ -36,7 +36,7 @@ python -m pip install \
   "tokenizers>=0.20.3" \
   "accelerate>=1.1.1" \
   tqdm imageio easydict ftfy dashscope imageio-ffmpeg wandb omegaconf einops \
-  av==13.1.0 open_clip_torch starlette pycocotools lmdb matplotlib sentencepiece \
+  av==13.1.0 open_clip_torch timm starlette pycocotools lmdb matplotlib sentencepiece \
   pydantic==2.10.6 scikit-image "huggingface_hub[cli]" dominate \
   flask flask-socketio torchao tensorboard ninja packaging "gradio>=4.44.0"
 

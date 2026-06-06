@@ -32,11 +32,12 @@ tokentrim_checkpoint_count: 0
 tokentrim_checkpoint_interval: 1
 tokentrim_checkpoint_device: cpu
 tokentrim_rollback_selector: drift
-tokentrim_dino_model_name: facebook/dinov2-small
+tokentrim_dino_model_name: vit_small_patch14_dinov2.lvd142m
 tokentrim_dino_device: cpu
 tokentrim_dino_subject_weight: 1.0
 tokentrim_dino_temporal_weight: 0.25
 tokentrim_dino_max_frames: 8
+tokentrim_dino_image_size: 518
 
 ckpt_step: 0
 prompt_name: MovieGenVideoBench
