@@ -1572,6 +1572,11 @@ class CausalInferencePipeline(torch.nn.Module):
                                     cpu_rng_state=best_candidate["cpu_rng_state"],
                                     cuda_rng_state=best_candidate["cuda_rng_state"],
                                 )
+                                tokentrim_checkpoints = [
+                                    checkpoint
+                                    for checkpoint in tokentrim_checkpoints
+                                    if checkpoint["next_window_index"] <= replay_start_window
+                                ]
                             else:
                                 replay_start_window = 0
                                 output.zero_()
@@ -1585,6 +1590,7 @@ class CausalInferencePipeline(torch.nn.Module):
                                 if best_candidate["cuda_rng_state"] is not None:
                                     torch.cuda.set_rng_state(best_candidate["cuda_rng_state"], noise.device)
                                 window_index = 0
+                                tokentrim_checkpoints.clear()
                             for finalizing_window in range(replay_start_window, failed_window_index + 1):
                                 tokentrim_rollback_attempts.pop(finalizing_window, None)
                                 tokentrim_rollback_candidates.pop(finalizing_window, None)
