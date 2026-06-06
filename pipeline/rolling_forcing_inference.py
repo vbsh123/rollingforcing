@@ -652,18 +652,28 @@ class CausalInferencePipeline(torch.nn.Module):
         )
         context_latents = output[:, context_start_frame:current_start_frame]
         with torch.no_grad():
-            candidate_pixels = self.vae.decode_to_pixel(candidate_latents, use_cache=False)
+            if context_latents.shape[1] > 0:
+                combined_pixels = self.vae.decode_to_pixel(
+                    torch.cat([context_latents, candidate_latents], dim=1),
+                    use_cache=False,
+                )
+                # Wan's two temporal upsampling stages produce four pixel frames
+                # for every appended latent frame after the sequence begins.
+                candidate_pixel_count = min(
+                    combined_pixels.shape[1],
+                    4 * candidate_latents.shape[1],
+                )
+                context_pixels = combined_pixels[:, :-candidate_pixel_count]
+                candidate_pixels = combined_pixels[:, -candidate_pixel_count:]
+            else:
+                context_pixels = None
+                candidate_pixels = self.vae.decode_to_pixel(candidate_latents, use_cache=False)
+
             candidate_embeddings = self._dino_frame_embeddings(candidate_pixels)
             del candidate_pixels
-            temporal_cost = torch.tensor(0.0, device=candidate_embeddings.device)
-            if candidate_embeddings.shape[0] > 1:
-                temporal_cost = 1.0 - (
-                    candidate_embeddings[:-1] * candidate_embeddings[1:]
-                ).sum(dim=-1).mean()
 
             subject_cost = torch.tensor(0.0, device=candidate_embeddings.device)
-            if context_latents.shape[1] > 0:
-                context_pixels = self.vae.decode_to_pixel(context_latents, use_cache=False)
+            if context_pixels is not None and context_pixels.shape[1] > 0:
                 context_embeddings = self._dino_frame_embeddings(context_pixels)
                 del context_pixels
                 reference_embedding = torch.nn.functional.normalize(
@@ -673,6 +683,18 @@ class CausalInferencePipeline(torch.nn.Module):
                 )
                 subject_cost = 1.0 - (
                     candidate_embeddings * reference_embedding
+                ).sum(dim=-1).mean()
+                temporal_embeddings = torch.cat(
+                    [context_embeddings[-1:], candidate_embeddings],
+                    dim=0,
+                )
+            else:
+                temporal_embeddings = candidate_embeddings
+
+            temporal_cost = torch.tensor(0.0, device=candidate_embeddings.device)
+            if temporal_embeddings.shape[0] > 1:
+                temporal_cost = 1.0 - (
+                    temporal_embeddings[:-1] * temporal_embeddings[1:]
                 ).sum(dim=-1).mean()
 
         components = {
