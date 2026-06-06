@@ -74,6 +74,12 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_selector_drift_weight = 0.05
         self.tokentrim_selector_rate_weight = 1.0
         self.tokentrim_selector_context_frames = 6
+        self.tokentrim_dino_model_name = "facebook/dinov2-small"
+        self.tokentrim_dino_device = "cpu"
+        self.tokentrim_dino_subject_weight = 1.0
+        self.tokentrim_dino_temporal_weight = 0.25
+        self.tokentrim_dino_max_frames = 8
+        self._tokentrim_dino_model = None
         self.tokentrim_rate_history_size = 8
         self.tokentrim_rate_warmup_steps = 3
         self.tokentrim_rate_z_threshold = 2.0
@@ -138,7 +144,7 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_rollback_selector = str(
                 getattr(args, "tokentrim_rollback_selector", "drift")
             )
-            valid_selectors = {"drift", "latent_temporal", "rate_anomaly"}
+            valid_selectors = {"drift", "latent_temporal", "rate_anomaly", "dino"}
             if self.tokentrim_rollback_selector not in valid_selectors:
                 raise ValueError(
                     "tokentrim_rollback_selector must be one of "
@@ -162,6 +168,20 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_selector_context_frames = max(
                 1,
                 int(getattr(args, "tokentrim_selector_context_frames", 6)),
+            )
+            self.tokentrim_dino_model_name = str(
+                getattr(args, "tokentrim_dino_model_name", "facebook/dinov2-small")
+            )
+            self.tokentrim_dino_device = str(getattr(args, "tokentrim_dino_device", "cpu"))
+            self.tokentrim_dino_subject_weight = float(
+                getattr(args, "tokentrim_dino_subject_weight", 1.0)
+            )
+            self.tokentrim_dino_temporal_weight = float(
+                getattr(args, "tokentrim_dino_temporal_weight", 0.25)
+            )
+            self.tokentrim_dino_max_frames = max(
+                1,
+                int(getattr(args, "tokentrim_dino_max_frames", 8)),
             )
             self.tokentrim_rate_history_size = max(
                 1,
@@ -568,6 +588,105 @@ class CausalInferencePipeline(torch.nn.Module):
             "token_indices": rate_token_indices.detach() if rate_token_indices is not None else token_indices,
         }
 
+    def _load_tokentrim_dino_model(self):
+        if self._tokentrim_dino_model is None:
+            from transformers import AutoModel
+
+            print(
+                "TokenTrim DINO load:",
+                f"model={self.tokentrim_dino_model_name}",
+                f"device={self.tokentrim_dino_device}",
+            )
+            self._tokentrim_dino_model = AutoModel.from_pretrained(
+                self.tokentrim_dino_model_name
+            ).eval().requires_grad_(False).to(self.tokentrim_dino_device)
+        return self._tokentrim_dino_model
+
+    def _dino_frame_embeddings(self, pixel_frames):
+        model = self._load_tokentrim_dino_model()
+        frames = pixel_frames.flatten(0, 1)
+        if frames.shape[0] > self.tokentrim_dino_max_frames:
+            frame_indices = torch.linspace(
+                0,
+                frames.shape[0] - 1,
+                self.tokentrim_dino_max_frames,
+                device=frames.device,
+            ).round().long()
+            frames = frames.index_select(0, frame_indices)
+        frames = torch.nn.functional.interpolate(
+            frames.float(),
+            size=(224, 224),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+        frames = (frames + 1.0) * 0.5
+        mean = torch.tensor(
+            [0.485, 0.456, 0.406],
+            device=frames.device,
+            dtype=frames.dtype,
+        )[None, :, None, None]
+        std = torch.tensor(
+            [0.229, 0.224, 0.225],
+            device=frames.device,
+            dtype=frames.dtype,
+        )[None, :, None, None]
+        frames = ((frames - mean) / std).to(self.tokentrim_dino_device)
+        with torch.no_grad():
+            output = model(pixel_values=frames)
+        embeddings = output.pooler_output
+        return torch.nn.functional.normalize(embeddings.float(), dim=-1, eps=1e-6)
+
+    def _score_dino_candidate(
+            self,
+            output,
+            denoised_pred,
+            current_start_frame,
+            current_end_frame,
+            severity,
+    ):
+        candidate_latents = denoised_pred[:, :self.num_frame_per_block]
+        context_start_frame = max(
+            0,
+            current_start_frame - self.tokentrim_selector_context_frames,
+        )
+        context_latents = output[:, context_start_frame:current_start_frame]
+        with torch.no_grad():
+            candidate_pixels = self.vae.decode_to_pixel(candidate_latents, use_cache=False)
+            candidate_embeddings = self._dino_frame_embeddings(candidate_pixels)
+            del candidate_pixels
+            temporal_cost = torch.tensor(0.0, device=candidate_embeddings.device)
+            if candidate_embeddings.shape[0] > 1:
+                temporal_cost = 1.0 - (
+                    candidate_embeddings[:-1] * candidate_embeddings[1:]
+                ).sum(dim=-1).mean()
+
+            subject_cost = torch.tensor(0.0, device=candidate_embeddings.device)
+            if context_latents.shape[1] > 0:
+                context_pixels = self.vae.decode_to_pixel(context_latents, use_cache=False)
+                context_embeddings = self._dino_frame_embeddings(context_pixels)
+                del context_pixels
+                reference_embedding = torch.nn.functional.normalize(
+                    context_embeddings.mean(dim=0, keepdim=True),
+                    dim=-1,
+                    eps=1e-6,
+                )
+                subject_cost = 1.0 - (
+                    candidate_embeddings * reference_embedding
+                ).sum(dim=-1).mean()
+
+        components = {
+            "dino_subject": float(subject_cost.detach().cpu().item()),
+            "dino_temporal": float(temporal_cost.detach().cpu().item()),
+            "drift": float(severity),
+        }
+        score = (
+            self.tokentrim_dino_subject_weight * components["dino_subject"]
+            + self.tokentrim_dino_temporal_weight * components["dino_temporal"]
+            + self.tokentrim_selector_drift_weight * components["drift"]
+        )
+        return float(score), components
+
     def _score_tokentrim_candidate(
             self,
             output,
@@ -590,6 +709,15 @@ class CausalInferencePipeline(torch.nn.Module):
                 + self.tokentrim_selector_drift_weight * float(severity)
             )
             return float(score), rate_components
+
+        if self.tokentrim_rollback_selector == "dino":
+            return self._score_dino_candidate(
+                output=output,
+                denoised_pred=denoised_pred,
+                current_start_frame=current_start_frame,
+                current_end_frame=current_end_frame,
+                severity=severity,
+            )
 
         candidate_frames = denoised_pred[:, :current_end_frame - current_start_frame]
         context_start_frame = max(0, current_start_frame - self.tokentrim_selector_context_frames)
@@ -1202,7 +1330,10 @@ class CausalInferencePipeline(torch.nn.Module):
                         else self.tokentrim_last_token_indices.detach()
                     )
                     original_fallbacks = []
-                    if original_token_indices is not None:
+                    if (
+                            original_token_indices is not None
+                            and self.tokentrim_rollback_selector != "dino"
+                    ):
                         for normalize_strength in self._rate_normalize_strengths():
                             fallback = self._estimate_rate_normalized_candidate(
                                 denoised_pred=denoised_pred,
@@ -1288,7 +1419,16 @@ class CausalInferencePipeline(torch.nn.Module):
                                 ),
                                 None,
                             )
-                            if non_pruned_rollback_candidates:
+                            if self.tokentrim_rollback_selector == "dino":
+                                best_candidate = min(
+                                    candidates,
+                                    key=lambda candidate: candidate.get(
+                                        "selector_score",
+                                        candidate["severity"],
+                                    ),
+                                )
+                                selection_reason = "dino_best_candidate"
+                            elif non_pruned_rollback_candidates:
                                 best_candidate = min(
                                     non_pruned_rollback_candidates,
                                     key=lambda candidate: candidate.get(
@@ -1340,6 +1480,7 @@ class CausalInferencePipeline(torch.nn.Module):
                             tokentrim_rollback_rate_normalizations.clear()
                             if (
                                     best_intervention == "original"
+                                    and selection_reason == "original_adaptive_fallback"
                                     and best_candidate.get("token_indices") is not None
                             ):
                                 original_fallbacks = best_candidate.get("original_fallbacks", [])

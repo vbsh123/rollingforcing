@@ -57,6 +57,11 @@ INSTALL_VBENCH=0 bash scripts/setup_vast_env.sh
 INSTALL_FLASH_ATTN=0 PATCH_SDPA_FALLBACK=1 bash scripts/setup_vast_env.sh
 ```
 
+The DINO-scored rollback experiment uses
+`configs/vast_tokentrim_rollback_dino_1_3b.yaml`. It keeps rate anomaly as the
+rollback trigger, then uses frozen `facebook/dinov2-small` embeddings to select
+the best candidate. The model downloads from Hugging Face on its first trigger.
+
 ## 🚀 Quick Start
 ### Download checkpoints
 ```
