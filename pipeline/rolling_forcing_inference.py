@@ -64,6 +64,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_rollback_suppress_cache = False
         self.tokentrim_rollback_reset_rng = False
         self.tokentrim_rollback_best_of_n = 1
+        self.tokentrim_rollback_cooldown_windows = 0
         self.tokentrim_rollback_depths = None
         self.tokentrim_rollback_interventions = ["none"]
         self.tokentrim_rollback_include_original = False
@@ -131,6 +132,10 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_rollback_suppress_cache = bool(getattr(args, "tokentrim_rollback_suppress_cache", False))
             self.tokentrim_rollback_reset_rng = bool(getattr(args, "tokentrim_rollback_reset_rng", False))
             self.tokentrim_rollback_best_of_n = int(getattr(args, "tokentrim_rollback_best_of_n", 1))
+            self.tokentrim_rollback_cooldown_windows = max(
+                0,
+                int(getattr(args, "tokentrim_rollback_cooldown_windows", 0)),
+            )
             rollback_depths = getattr(args, "tokentrim_rollback_depths", None)
             self.tokentrim_rollback_depths = (
                 [int(depth) for depth in rollback_depths]
@@ -1146,6 +1151,7 @@ class CausalInferencePipeline(torch.nn.Module):
         tokentrim_rollback_queues = {}
         tokentrim_active_candidate = None
         tokentrim_finalizing_windows = set()
+        tokentrim_rollback_cooldown_until = 0
         tokentrim_checkpoints = []
         tokentrim_original_checkpoints = {}
         initial_cpu_rng_state = torch.get_rng_state() if self.tokentrim_rollback_reset_rng else None
@@ -1389,12 +1395,28 @@ class CausalInferencePipeline(torch.nn.Module):
                 tokentrim_active_candidate = None
                 tokentrim_candidate_recorded = True
 
+            tokentrim_rollback_cooldown_active = (
+                self.tokentrim_last_pruned
+                and tokentrim_active_candidate is None
+                and window_index not in tokentrim_rollback_queues
+                and window_index < tokentrim_rollback_cooldown_until
+            )
+            if tokentrim_rollback_cooldown_active:
+                print(
+                    "TokenTrim rollback skipped:",
+                    "reason=cooldown",
+                    f"window={window_index}",
+                    f"remaining={tokentrim_rollback_cooldown_until - window_index}",
+                    f"next_eligible={tokentrim_rollback_cooldown_until}",
+                )
+
             if (
                     self.tokentrim_enabled
                     and self.tokentrim_rollback_experimental
                     and self.tokentrim_rollback_windows > 0
                     and self.tokentrim_rollback_max_attempts > 0
                     and tokentrim_active_candidate is None
+                    and not tokentrim_rollback_cooldown_active
                     and (
                         self.tokentrim_last_pruned
                         or (
@@ -1764,11 +1786,17 @@ class CausalInferencePipeline(torch.nn.Module):
                                     tokentrim_finalizing_windows.discard(finalized_window)
                                 tokentrim_rollback_suppressions.clear()
                                 tokentrim_rollback_rate_normalizations.clear()
+                                tokentrim_rollback_cooldown_until = (
+                                    failed_window_index
+                                    + self.tokentrim_rollback_cooldown_windows
+                                    + 1
+                                )
                                 print(
                                     "TokenTrim rollback commit:",
                                     f"window={failed_window_index}",
                                     "state=completed_candidate",
                                     f"next_window={failed_window_index + 1}",
+                                    f"cooldown_until={tokentrim_rollback_cooldown_until}",
                                 )
                             elif restore_checkpoint is not None:
                                 replay_start_window = restore_checkpoint["next_window_index"]
