@@ -63,6 +63,13 @@ rollback trigger, then uses frozen timm
 `vit_small_patch14_dinov2.lvd142m` embeddings to select the best candidate.
 The pretrained weights download on its first trigger.
 
+The periodic plain-resampling experiment uses
+`configs/vast_periodic_resample_dino_1_3b.yaml`. It does not use token drift or
+token interventions. Every ten windows it compares the original continuation
+against three fresh-noise samples from each of the two latest rollback depths.
+DINO commits an alternative only when it beats the original by the configured
+minimum margin.
+
 ## 🚀 Quick Start
 ### Download checkpoints
 ```

@@ -19,6 +19,9 @@ tokentrim_debug: false
 tokentrim_patch_size:
   - 2
   - 2
+tokentrim_trigger_mode: tokentrim
+tokentrim_periodic_interval: 0
+tokentrim_periodic_start_window: 0
 tokentrim_rollback_windows: 0
 tokentrim_rollback_max_attempts: 0
 tokentrim_rollback_experimental: false
@@ -26,6 +29,7 @@ tokentrim_rollback_suppress_cache: false
 tokentrim_rollback_reset_rng: false
 tokentrim_rollback_best_of_n: 1
 tokentrim_rollback_cooldown_windows: 0
+tokentrim_rollback_resample_noise: false
 tokentrim_rollback_depths:
 tokentrim_rollback_interventions:
   - none
@@ -39,6 +43,7 @@ tokentrim_dino_subject_weight: 1.0
 tokentrim_dino_temporal_weight: 0.25
 tokentrim_dino_max_frames: 8
 tokentrim_dino_image_size: 518
+tokentrim_dino_min_improvement: 0.0
 
 ckpt_step: 0
 prompt_name: MovieGenVideoBench
