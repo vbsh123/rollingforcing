@@ -1314,14 +1314,6 @@ class CausalInferencePipeline(torch.nn.Module):
                     self._format_tokentrim_selector_components(tokentrim_rate_normalize_components),
                 )
 
-            denoised_pred = self._maybe_tokentrim_reroll(
-                denoised_pred=denoised_pred,
-                noisy_input=noisy_input,
-                conditional_dict=conditional_dict,
-                current_timestep=current_timestep,
-                current_start_frame=current_start_frame,
-                cache_snapshot=tokentrim_cache_snapshot,
-            )
             if self.tokentrim_enabled and self.tokentrim_trigger_mode == "periodic":
                 periodic_trigger = (
                     tokentrim_active_candidate is None
@@ -1332,6 +1324,12 @@ class CausalInferencePipeline(torch.nn.Module):
                 )
                 self.tokentrim_last_pruned = periodic_trigger
                 self.tokentrim_last_token_indices = None
+                self.tokentrim_last_severity = 0.0
+                self.tokentrim_last_threshold = None
+                self.tokentrim_last_drift = None
+                self.tokentrim_last_rate_score = None
+                self.tokentrim_last_rate_components = None
+                self.tokentrim_last_rate_token_indices = None
                 if self.tokentrim_debug and periodic_trigger:
                     print(
                         "TokenTrim periodic trigger:",
@@ -1339,6 +1337,15 @@ class CausalInferencePipeline(torch.nn.Module):
                         f"interval={self.tokentrim_periodic_interval}",
                         f"start={self.tokentrim_periodic_start_window}",
                     )
+            else:
+                denoised_pred = self._maybe_tokentrim_reroll(
+                    denoised_pred=denoised_pred,
+                    noisy_input=noisy_input,
+                    conditional_dict=conditional_dict,
+                    current_timestep=current_timestep,
+                    current_start_frame=current_start_frame,
+                    cache_snapshot=tokentrim_cache_snapshot,
+                )
 
             tokentrim_candidate_recorded = False
             if (
