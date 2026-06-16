@@ -2,6 +2,9 @@ from collections.abc import Mapping
 from typing import List, Optional
 import copy
 import gc
+import json
+import os
+import random
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
@@ -60,6 +63,9 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_trigger_mode = "tokentrim"
         self.tokentrim_periodic_interval = 0
         self.tokentrim_periodic_start_window = 0
+        self.tokentrim_random_control_probability = 0.0
+        self.tokentrim_random_control_seed = 0
+        self.tokentrim_manifest_path = None
         self.tokentrim_rollback_windows = 0
         self.tokentrim_rollback_max_attempts = 0
         self.tokentrim_rollback_experimental = False
@@ -85,6 +91,9 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_dino_max_frames = 8
         self.tokentrim_dino_image_size = 518
         self.tokentrim_dino_min_improvement = 0.0
+        self.tokentrim_dino_trigger_history_size = 8
+        self.tokentrim_dino_trigger_warmup_steps = 4
+        self.tokentrim_dino_trigger_z_threshold = 2.0
         self._tokentrim_dino_model = None
         self.tokentrim_rate_history_size = 8
         self.tokentrim_rate_warmup_steps = 3
@@ -124,7 +133,7 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_debug = bool(getattr(args, "tokentrim_debug", False))
             self.tokentrim_patch_size = tuple(getattr(args, "tokentrim_patch_size", [2, 2]))
             self.tokentrim_trigger_mode = str(getattr(args, "tokentrim_trigger_mode", "tokentrim"))
-            valid_triggers = {"tokentrim", "rate_anomaly", "periodic"}
+            valid_triggers = {"tokentrim", "rate_anomaly", "rate_anomaly_control", "periodic", "dino"}
             if self.tokentrim_trigger_mode not in valid_triggers:
                 raise ValueError(
                     "tokentrim_trigger_mode must be one of "
@@ -140,6 +149,16 @@ class CausalInferencePipeline(torch.nn.Module):
             )
             if self.tokentrim_trigger_mode == "periodic" and self.tokentrim_periodic_interval <= 0:
                 raise ValueError("tokentrim_periodic_interval must be positive for periodic triggering")
+            self.tokentrim_random_control_probability = float(
+                getattr(args, "tokentrim_random_control_probability", 0.0)
+            )
+            if not 0.0 <= self.tokentrim_random_control_probability <= 1.0:
+                raise ValueError("tokentrim_random_control_probability must be in [0, 1]")
+            self.tokentrim_random_control_seed = int(
+                getattr(args, "tokentrim_random_control_seed", 0)
+            )
+            manifest_path = getattr(args, "tokentrim_manifest_path", None)
+            self.tokentrim_manifest_path = str(manifest_path) if manifest_path else None
             self.tokentrim_rollback_windows = int(getattr(args, "tokentrim_rollback_windows", 0))
             self.tokentrim_rollback_max_attempts = int(getattr(args, "tokentrim_rollback_max_attempts", 0))
             self.tokentrim_rollback_experimental = bool(getattr(args, "tokentrim_rollback_experimental", False))
@@ -214,6 +233,17 @@ class CausalInferencePipeline(torch.nn.Module):
                 0.0,
                 float(getattr(args, "tokentrim_dino_min_improvement", 0.0)),
             )
+            self.tokentrim_dino_trigger_history_size = max(
+                1,
+                int(getattr(args, "tokentrim_dino_trigger_history_size", 8)),
+            )
+            self.tokentrim_dino_trigger_warmup_steps = max(
+                1,
+                int(getattr(args, "tokentrim_dino_trigger_warmup_steps", 4)),
+            )
+            self.tokentrim_dino_trigger_z_threshold = float(
+                getattr(args, "tokentrim_dino_trigger_z_threshold", 2.0)
+            )
             self.tokentrim_rate_history_size = max(
                 1,
                 int(getattr(args, "tokentrim_rate_history_size", 8)),
@@ -247,6 +277,15 @@ class CausalInferencePipeline(torch.nn.Module):
             }
             for layer_cache in kv_cache
         ]
+
+    def _append_tokentrim_manifest(self, record):
+        if not self.tokentrim_manifest_path:
+            return
+        manifest_dir = os.path.dirname(self.tokentrim_manifest_path)
+        if manifest_dir:
+            os.makedirs(manifest_dir, exist_ok=True)
+        with open(self.tokentrim_manifest_path, "a", encoding="utf-8") as manifest:
+            manifest.write(json.dumps(record, sort_keys=True) + "\n")
 
     @staticmethod
     def _restore_kv_cache(target, snapshot):
@@ -384,7 +423,7 @@ class CausalInferencePipeline(torch.nn.Module):
         specs = []
         for depth in depths:
             target_window_index = max(0, failed_window_index - depth)
-            if target_window_index >= failed_window_index:
+            if target_window_index > failed_window_index:
                 continue
             for intervention in interventions:
                 specs.append({
@@ -929,7 +968,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_last_rate_score = rate_score
         self.tokentrim_last_rate_components = rate_components
         self.tokentrim_last_rate_token_indices = rate_token_indices
-        if self.tokentrim_trigger_mode == "rate_anomaly":
+        if self.tokentrim_trigger_mode in {"rate_anomaly", "rate_anomaly_control"}:
             self.tokentrim_last_pruned = rate_should_prune
             if rate_should_prune and rate_token_indices is not None:
                 self.tokentrim_last_token_indices = rate_token_indices.detach()
@@ -996,7 +1035,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_last_rate_score = rate_score
         self.tokentrim_last_rate_components = rate_components
         self.tokentrim_last_rate_token_indices = rate_token_indices
-        if self.tokentrim_trigger_mode == "rate_anomaly":
+        if self.tokentrim_trigger_mode in {"rate_anomaly", "rate_anomaly_control"}:
             self.tokentrim_last_pruned = rate_should_prune
             if rate_should_prune and rate_token_indices is not None:
                 self.tokentrim_last_token_indices = rate_token_indices.detach()
@@ -1173,8 +1212,12 @@ class CausalInferencePipeline(torch.nn.Module):
         tokentrim_active_candidate = None
         tokentrim_finalizing_windows = set()
         tokentrim_rollback_cooldown_until = 0
+        tokentrim_dino_trigger_history = []
         tokentrim_checkpoints = []
         tokentrim_original_checkpoints = {}
+        tokentrim_event_sources = {}
+        tokentrim_event_features = {}
+        tokentrim_control_rng = random.Random(self.tokentrim_random_control_seed)
         initial_cpu_rng_state = torch.get_rng_state() if self.tokentrim_rollback_reset_rng else None
         initial_cuda_rng_state = (
             torch.cuda.get_rng_state(noise.device)
@@ -1314,15 +1357,8 @@ class CausalInferencePipeline(torch.nn.Module):
                     self._format_tokentrim_selector_components(tokentrim_rate_normalize_components),
                 )
 
-            if self.tokentrim_enabled and self.tokentrim_trigger_mode == "periodic":
-                periodic_trigger = (
-                    tokentrim_active_candidate is None
-                    and window_index >= self.tokentrim_periodic_start_window
-                    and (
-                        window_index - self.tokentrim_periodic_start_window
-                    ) % self.tokentrim_periodic_interval == 0
-                )
-                self.tokentrim_last_pruned = periodic_trigger
+            if self.tokentrim_enabled and self.tokentrim_trigger_mode in {"periodic", "dino"}:
+                self.tokentrim_last_pruned = False
                 self.tokentrim_last_token_indices = None
                 self.tokentrim_last_severity = 0.0
                 self.tokentrim_last_threshold = None
@@ -1330,13 +1366,93 @@ class CausalInferencePipeline(torch.nn.Module):
                 self.tokentrim_last_rate_score = None
                 self.tokentrim_last_rate_components = None
                 self.tokentrim_last_rate_token_indices = None
-                if self.tokentrim_debug and periodic_trigger:
-                    print(
-                        "TokenTrim periodic trigger:",
-                        f"window={window_index}",
-                        f"interval={self.tokentrim_periodic_interval}",
-                        f"start={self.tokentrim_periodic_start_window}",
+
+                if self.tokentrim_trigger_mode == "periodic":
+                    periodic_trigger = (
+                        tokentrim_active_candidate is None
+                        and window_index >= self.tokentrim_periodic_start_window
+                        and (
+                            window_index - self.tokentrim_periodic_start_window
+                        ) % self.tokentrim_periodic_interval == 0
                     )
+                    self.tokentrim_last_pruned = periodic_trigger
+                    if self.tokentrim_debug and periodic_trigger:
+                        print(
+                            "TokenTrim periodic trigger:",
+                            f"window={window_index}",
+                            f"interval={self.tokentrim_periodic_interval}",
+                            f"start={self.tokentrim_periodic_start_window}",
+                        )
+                elif (
+                        tokentrim_active_candidate is None
+                        and window_index not in tokentrim_rollback_queues
+                ):
+                    dino_trigger_eligible = window_index >= tokentrim_rollback_cooldown_until
+                    selector_score, selector_components = self._score_tokentrim_candidate(
+                        output=output,
+                        denoised_pred=denoised_pred,
+                        current_start_frame=current_start_frame,
+                        current_end_frame=current_end_frame,
+                        severity=0.0,
+                        drift=None,
+                        candidate_start_frame=(
+                            current_start_frame
+                            - max(
+                                self.tokentrim_rollback_depths
+                                or [self.tokentrim_rollback_windows]
+                            ) * self.num_frame_per_block
+                        ),
+                    )
+                    dino_trigger_mean = 0.0
+                    dino_trigger_std = 0.0
+                    dino_trigger_z = 0.0
+                    if len(tokentrim_dino_trigger_history) >= self.tokentrim_dino_trigger_warmup_steps:
+                        history = torch.tensor(
+                            tokentrim_dino_trigger_history[-self.tokentrim_dino_trigger_history_size:],
+                            dtype=torch.float32,
+                        )
+                        dino_trigger_mean = float(history.mean().item())
+                        dino_trigger_std = float(history.std(unbiased=False).clamp_min(1e-6).item())
+                        dino_trigger_z = (selector_score - dino_trigger_mean) / dino_trigger_std
+                        self.tokentrim_last_pruned = (
+                            dino_trigger_eligible
+                            and
+                            dino_trigger_z > self.tokentrim_dino_trigger_z_threshold
+                        )
+                    tokentrim_dino_trigger_history.append(float(selector_score))
+                    if len(tokentrim_dino_trigger_history) > self.tokentrim_dino_trigger_history_size:
+                        tokentrim_dino_trigger_history = tokentrim_dino_trigger_history[
+                            -self.tokentrim_dino_trigger_history_size:
+                        ]
+                    self.tokentrim_last_rate_score = selector_score
+                    self.tokentrim_last_rate_components = {
+                        "dino_trigger_score": float(selector_score),
+                        "dino_trigger_mean": dino_trigger_mean,
+                        "dino_trigger_std": dino_trigger_std,
+                        "dino_trigger_z": float(dino_trigger_z),
+                        **selector_components,
+                    }
+                    tokentrim_event_features[window_index] = {
+                        "severity": 0.0,
+                        "threshold": self.tokentrim_dino_trigger_z_threshold,
+                        "rate_score": float(selector_score),
+                        "rate_components": copy.deepcopy(self.tokentrim_last_rate_components),
+                        "selected_token_count": 0,
+                    }
+                    if self.tokentrim_debug:
+                        print(
+                            "TokenTrim DINO trigger:",
+                            f"window={window_index}",
+                            f"score={selector_score:.4f}",
+                            f"z={dino_trigger_z:.4f}",
+                            f"threshold={self.tokentrim_dino_trigger_z_threshold:.4f}",
+                            f"history={len(tokentrim_dino_trigger_history)}",
+                            f"eligible={dino_trigger_eligible}",
+                            f"decision={'prune_and_reroll' if self.tokentrim_last_pruned else 'accept'}",
+                            self._format_tokentrim_selector_components(selector_components),
+                        )
+                    if self.tokentrim_last_pruned:
+                        tokentrim_event_sources[window_index] = "dino"
             else:
                 denoised_pred = self._maybe_tokentrim_reroll(
                     denoised_pred=denoised_pred,
@@ -1346,6 +1462,25 @@ class CausalInferencePipeline(torch.nn.Module):
                     current_start_frame=current_start_frame,
                     cache_snapshot=tokentrim_cache_snapshot,
                 )
+                if (
+                        self.tokentrim_trigger_mode == "rate_anomaly_control"
+                        and tokentrim_active_candidate is None
+                        and window_index not in tokentrim_rollback_queues
+                        and window_index >= tokentrim_rollback_cooldown_until
+                        and self.tokentrim_last_severity is not None
+                ):
+                    if self.tokentrim_last_pruned:
+                        tokentrim_event_sources[window_index] = "rate_anomaly"
+                    elif tokentrim_control_rng.random() < self.tokentrim_random_control_probability:
+                        self.tokentrim_last_pruned = True
+                        self.tokentrim_last_token_indices = None
+                        tokentrim_event_sources[window_index] = "random_control"
+                        if self.tokentrim_debug:
+                            print(
+                                "TokenTrim random control trigger:",
+                                f"window={window_index}",
+                                f"probability={self.tokentrim_random_control_probability}",
+                            )
 
             tokentrim_candidate_recorded = False
             if (
@@ -1492,6 +1627,35 @@ class CausalInferencePipeline(torch.nn.Module):
             ):
                 attempts_used = tokentrim_rollback_attempts.get(window_index, 0)
                 if window_index not in tokentrim_rollback_queues:
+                    tokentrim_event_sources.setdefault(
+                        window_index,
+                        "periodic" if self.tokentrim_trigger_mode == "periodic" else self.tokentrim_trigger_mode,
+                    )
+                    tokentrim_event_features.setdefault(window_index, {
+                        "severity": (
+                            None
+                            if self.tokentrim_last_severity is None
+                            else float(self.tokentrim_last_severity)
+                        ),
+                        "threshold": (
+                            None
+                            if self.tokentrim_last_threshold is None
+                            else float(self.tokentrim_last_threshold)
+                        ),
+                        "rate_score": (
+                            None
+                            if self.tokentrim_last_rate_score is None
+                            else float(self.tokentrim_last_rate_score)
+                        ),
+                        "rate_components": copy.deepcopy(
+                            self.tokentrim_last_rate_components
+                        ),
+                        "selected_token_count": (
+                            0
+                            if self.tokentrim_last_token_indices is None
+                            else int(self.tokentrim_last_token_indices.numel())
+                        ),
+                    })
                     base_specs = self._rollback_candidate_specs(
                         window_index,
                         self.tokentrim_last_token_indices,
@@ -1768,6 +1932,79 @@ class CausalInferencePipeline(torch.nn.Module):
                                 f"strength={best_candidate.get('intervention_strength')}",
                                 f"checkpoint_next={restore_checkpoint['next_window_index'] if restore_checkpoint else 0}",
                             )
+                            candidate_records = []
+                            for candidate in candidates:
+                                candidate_depth = candidate.get("depth")
+                                candidate_intervention = candidate.get("intervention")
+                                category = (
+                                    "original"
+                                    if candidate_intervention == "original"
+                                    else (
+                                        "current_resample"
+                                        if candidate_depth == 0
+                                        else f"rollback_minus_{candidate_depth}"
+                                    )
+                                )
+                                candidate_records.append({
+                                    "category": category,
+                                    "depth": candidate_depth,
+                                    "sample": candidate.get("sample_index"),
+                                    "intervention": candidate_intervention,
+                                    "score": candidate.get("selector_score"),
+                                    "severity": candidate.get("severity"),
+                                    "pruned": candidate.get("pruned"),
+                                    "selector_components": candidate.get("selector_components", {}),
+                                })
+                            best_by_category = {}
+                            for candidate_record in candidate_records:
+                                category = candidate_record["category"]
+                                if (
+                                        category not in best_by_category
+                                        or candidate_record["score"] < best_by_category[category]["score"]
+                                ):
+                                    best_by_category[category] = candidate_record
+                            winner_category = (
+                                "original"
+                                if best_intervention == "original"
+                                else (
+                                    "current_resample"
+                                    if best_depth == 0
+                                    else f"rollback_minus_{best_depth}"
+                                )
+                            )
+                            raw_best_category = min(
+                                best_by_category,
+                                key=lambda category: best_by_category[category]["score"],
+                            )
+                            self._append_tokentrim_manifest({
+                                "schema_version": 1,
+                                "run_id": os.environ.get("ROLLBACK_RUN_ID"),
+                                "seed": os.environ.get("ROLLBACK_SEED"),
+                                "prompt": text_prompts[0] if text_prompts else None,
+                                "window": failed_window_index,
+                                "start_frame": current_start_frame,
+                                "event_source": tokentrim_event_sources.get(
+                                    failed_window_index,
+                                    self.tokentrim_trigger_mode,
+                                ),
+                                "trigger_features": tokentrim_event_features.get(
+                                    failed_window_index,
+                                    {},
+                                ),
+                                "raw_best_category": raw_best_category,
+                                "winner_category": winner_category,
+                                "winner_depth": best_depth,
+                                "winner_sample": best_candidate.get("sample_index"),
+                                "selection_reason": selection_reason,
+                                "winner_score": best_score,
+                                "original_score": original_score,
+                                "candidate_count": len(candidate_records),
+                                "improvement_over_original": (
+                                    None if original_score is None else original_score - best_score
+                                ),
+                                "best_by_category": best_by_category,
+                                "candidates": candidate_records,
+                            })
                             tokentrim_rollback_suppressions.clear()
                             tokentrim_rollback_rate_normalizations.clear()
                             if (
@@ -1884,6 +2121,8 @@ class CausalInferencePipeline(torch.nn.Module):
                                     tokentrim_rollback_candidates.pop(finalized_window, None)
                                     tokentrim_rollback_queues.pop(finalized_window, None)
                                     tokentrim_original_checkpoints.pop(finalized_window, None)
+                                    tokentrim_event_sources.pop(finalized_window, None)
+                                    tokentrim_event_features.pop(finalized_window, None)
                                     tokentrim_finalizing_windows.discard(finalized_window)
                                 tokentrim_rollback_suppressions.clear()
                                 tokentrim_rollback_rate_normalizations.clear()
@@ -1933,6 +2172,8 @@ class CausalInferencePipeline(torch.nn.Module):
                                     tokentrim_rollback_candidates.pop(finalizing_window, None)
                                     tokentrim_rollback_queues.pop(finalizing_window, None)
                                     tokentrim_original_checkpoints.pop(finalizing_window, None)
+                                    tokentrim_event_sources.pop(finalizing_window, None)
+                                    tokentrim_event_features.pop(finalizing_window, None)
                                     tokentrim_finalizing_windows.add(finalizing_window)
                                 continue
                     else:

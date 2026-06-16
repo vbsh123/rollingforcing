@@ -12,10 +12,94 @@ INSTALL_FLASH_ATTN="${INSTALL_FLASH_ATTN:-1}"
 PATCH_SDPA_FALLBACK="${PATCH_SDPA_FALLBACK:-0}"
 INSTALL_VBENCH="${INSTALL_VBENCH:-1}"
 CREATE_VAST_CONFIGS="${CREATE_VAST_CONFIGS:-1}"
+INSTALL_AZURE_CLI="${INSTALL_AZURE_CLI:-0}"
+SETUP_AZURE_STORAGE="${SETUP_AZURE_STORAGE:-0}"
+AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-rollingforcing-research}"
+AZURE_LOCATION="${AZURE_LOCATION:-eastus}"
+AZURE_STORAGE_ACCOUNT="${AZURE_STORAGE_ACCOUNT:-}"
+AZURE_CONTAINER="${AZURE_CONTAINER:-rollback-dataset}"
+AZURE_PREFIX="${AZURE_PREFIX:-rollback-dataset}"
+AZURE_ENV_FILE="${AZURE_ENV_FILE:-azure_storage.env}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "$PYTHON_BIN was not found. Set PYTHON_BIN=/path/to/python before running this script."
   exit 1
+fi
+
+if [[ "$INSTALL_AZURE_CLI" == "1" ]]; then
+  if command -v az >/dev/null 2>&1; then
+    echo "Azure CLI is already installed."
+  else
+    echo "Installing Azure CLI."
+    if command -v sudo >/dev/null 2>&1; then
+      curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+    else
+      curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+    fi
+  fi
+fi
+
+if [[ "$SETUP_AZURE_STORAGE" == "1" ]]; then
+  if ! command -v az >/dev/null 2>&1; then
+    echo "Azure CLI was not found. Rerun with INSTALL_AZURE_CLI=1 or install az first."
+    exit 1
+  fi
+
+  if ! az account show >/dev/null 2>&1; then
+    echo "Azure CLI is not logged in. Run: az login --use-device-code"
+    exit 1
+  fi
+
+  if [[ -z "$AZURE_STORAGE_ACCOUNT" ]]; then
+    AZURE_STORAGE_ACCOUNT="rfrollback${RANDOM}${RANDOM}"
+  fi
+
+  echo "Creating Azure storage resources."
+  echo "  resource group: $AZURE_RESOURCE_GROUP"
+  echo "  location: $AZURE_LOCATION"
+  echo "  storage account: $AZURE_STORAGE_ACCOUNT"
+  echo "  container: $AZURE_CONTAINER"
+
+  az provider register --namespace Microsoft.Storage
+  az group create \
+    --name "$AZURE_RESOURCE_GROUP" \
+    --location "$AZURE_LOCATION"
+  az storage account create \
+    --name "$AZURE_STORAGE_ACCOUNT" \
+    --resource-group "$AZURE_RESOURCE_GROUP" \
+    --location "$AZURE_LOCATION" \
+    --sku Standard_LRS \
+    --kind StorageV2 \
+    --allow-blob-public-access false
+
+  USER_ID="$(az ad signed-in-user show --query id -o tsv)"
+  STORAGE_ID="$(az storage account show \
+    --name "$AZURE_STORAGE_ACCOUNT" \
+    --resource-group "$AZURE_RESOURCE_GROUP" \
+    --query id -o tsv)"
+
+  az role assignment create \
+    --assignee "$USER_ID" \
+    --role "Storage Blob Data Contributor" \
+    --scope "$STORAGE_ID" \
+    || true
+
+  echo "Waiting briefly for Azure storage role propagation."
+  sleep 30
+
+  az storage container create \
+    --account-name "$AZURE_STORAGE_ACCOUNT" \
+    --name "$AZURE_CONTAINER" \
+    --auth-mode login
+
+  cat > "$AZURE_ENV_FILE" <<EOF
+export AZURE_STORAGE_ACCOUNT="$AZURE_STORAGE_ACCOUNT"
+export AZURE_CONTAINER="$AZURE_CONTAINER"
+export AZURE_PREFIX="$AZURE_PREFIX"
+EOF
+
+  echo "Wrote Azure upload env file: $AZURE_ENV_FILE"
+  echo "Use it with: source $AZURE_ENV_FILE"
 fi
 
 echo "Creating RollingForcing environment: $RF_VENV_DIR"

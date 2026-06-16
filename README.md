@@ -70,6 +70,37 @@ against three fresh-noise samples from each of the two latest rollback depths.
 DINO commits an alternative only when it beats the original by the configured
 minimum margin.
 
+### Rollback trigger dataset collection
+
+`configs/vast_rollback_trigger_dataset_1_3b.yaml` collects candidate-search
+outcomes when DINO local consistency drops relative to recent windows. Each
+search compares the unchanged original against three fresh-noise samples from
+each of the current, rollback-minus-1, and rollback-minus-2 windows. DINO
+selects the committed candidate and every candidate score is appended to a
+JSONL manifest.
+
+Run paired experiment and baseline shards across prompts and seeds:
+
+```bash
+PROMPT_FILE=prompts/rollback_audit_prompts.txt \
+SEEDS="0 1" \
+ROLLBACK_DINO_TRIGGER_Z=2.0 \
+RUN_ID=rollback-depth-v1 \
+bash scripts/run_rollback_dataset_shard.sh
+```
+
+Completed seed shards can be uploaded automatically by setting
+`AZURE_STORAGE_ACCOUNT` and `AZURE_CONTAINER`. Existing shards with a `DONE`
+marker are skipped when the command is resumed. The runner writes per-seed and
+run-level `summary.txt` / `summary.json` files after generation.
+
+Summarize winner rates and DINO improvements:
+
+```bash
+python scripts/summarize_rollback_manifest.py \
+  'rollback_dataset/rollback-depth-v1/seed_*/events.jsonl'
+```
+
 ## 🚀 Quick Start
 ### Download checkpoints
 ```

@@ -32,6 +32,8 @@ parser.add_argument("--seed", type=int, default=0, help="Random seed")
 parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to generate per prompt")
 parser.add_argument("--save_with_index", action="store_true",
                     help="Whether to save the video using the index or prompt as the filename")
+parser.add_argument("--reset_seed_per_prompt", action="store_true",
+                    help="Reset RNG from the base seed and prompt index before each prompt")
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -125,6 +127,10 @@ def encode(self, videos: torch.Tensor) -> torch.Tensor:
 
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     idx = batch_data['idx'].item()
+    if args.reset_seed_per_prompt:
+        prompt_seed = args.seed + idx * 1000003 + local_rank
+        set_seed(prompt_seed)
+        print(f"Prompt seed: idx={idx} seed={prompt_seed}")
 
     # For DataLoader batch_size=1, the batch_data is already a single item, but in a batch container
     # Unpack the batch data for convenience
