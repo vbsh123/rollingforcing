@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import random
+import sys
 import tempfile
 import torch
 
@@ -103,6 +104,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_stream_reward_video_class = "video_reward.inference.VideoVLMRewardInference"
         self.tokentrim_stream_reward_hpsv3_kwargs = {}
         self.tokentrim_stream_reward_video_kwargs = {}
+        self.tokentrim_stream_reward_video_repo_path = ""
         self.tokentrim_stream_reward_use_hpsv3 = True
         self.tokentrim_stream_reward_use_video = True
         self.tokentrim_stream_reward_video_key = "Overall"
@@ -300,6 +302,9 @@ class CausalInferencePipeline(torch.nn.Module):
             )
             self.tokentrim_stream_reward_video_kwargs = dict(
                 getattr(args, "tokentrim_stream_reward_video_kwargs", {}) or {}
+            )
+            self.tokentrim_stream_reward_video_repo_path = str(
+                getattr(args, "tokentrim_stream_reward_video_repo_path", "")
             )
             self.tokentrim_stream_reward_use_hpsv3 = bool(
                 getattr(args, "tokentrim_stream_reward_use_hpsv3", True)
@@ -908,6 +913,58 @@ class CausalInferencePipeline(torch.nn.Module):
                 f"Could not find {attr_name!r} in {module_name!r} for {name}."
             ) from exc
 
+    def _import_videoalign_object(self):
+        if not self.tokentrim_stream_reward_video_repo_path:
+            return self._import_tokentrim_object(
+                self.tokentrim_stream_reward_video_class,
+                "tokentrim_stream_reward_video_class",
+            )
+
+        videoalign_path = self.tokentrim_stream_reward_video_repo_path
+        if not os.path.isdir(videoalign_path):
+            raise FileNotFoundError(
+                f"VideoAlign repo path does not exist: {videoalign_path}"
+            )
+        module_name, attr_name = self.tokentrim_stream_reward_video_class.rsplit(".", 1)
+
+        previous_path = list(sys.path)
+        shadowed_modules = {}
+        for module_key in (
+                "utils",
+                "data",
+                "train_reward",
+                "trainer",
+                "prompt_template",
+                "vision_process",
+                "inference",
+        ):
+            if module_key in sys.modules:
+                shadowed_modules[module_key] = sys.modules.pop(module_key)
+        try:
+            sys.path.insert(0, videoalign_path)
+            module = importlib.import_module(module_name)
+            return getattr(module, attr_name)
+        except (ImportError, AttributeError) as exc:
+            raise ImportError(
+                "Could not import VideoAlign reward class "
+                f"{self.tokentrim_stream_reward_video_class!r} from "
+                f"{videoalign_path!r}."
+            ) from exc
+        finally:
+            sys.path = previous_path
+            for module_key in (
+                    "utils",
+                    "data",
+                    "train_reward",
+                    "trainer",
+                    "prompt_template",
+                    "vision_process",
+                    "inference",
+            ):
+                if module_key in sys.modules:
+                    del sys.modules[module_key]
+            sys.modules.update(shadowed_modules)
+
     def _load_tokentrim_hpsv3_reward(self):
         if self._tokentrim_hpsv3_reward is None:
             reward_cls = self._import_tokentrim_object(
@@ -925,10 +982,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
     def _load_tokentrim_video_reward(self):
         if self._tokentrim_video_reward is None:
-            reward_cls = self._import_tokentrim_object(
-                self.tokentrim_stream_reward_video_class,
-                "tokentrim_stream_reward_video_class",
-            )
+            reward_cls = self._import_videoalign_object()
             print(
                 "TokenTrim video reward load:",
                 f"class={self.tokentrim_stream_reward_video_class}",

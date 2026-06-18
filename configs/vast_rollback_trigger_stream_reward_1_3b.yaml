@@ -91,6 +91,7 @@ tokentrim_stream_reward_hpsv3_kwargs: {}
 tokentrim_stream_reward_video_kwargs:
   load_from_pretrained: /workspace/reward_models/VideoAlign/checkpoints/VideoReward
   device: cuda
+tokentrim_stream_reward_video_repo_path: /workspace/reward_models/VideoAlign
 tokentrim_stream_reward_use_hpsv3: false
 tokentrim_stream_reward_use_video: true
 tokentrim_stream_reward_video_key: Overall
