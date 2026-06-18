@@ -91,6 +91,8 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_dino_max_frames = 8
         self.tokentrim_dino_image_size = 518
         self.tokentrim_dino_min_improvement = 0.0
+        self.tokentrim_dino_trigger_context_frames = 2
+        self.tokentrim_dino_trigger_max_frames = 8
         self.tokentrim_dino_trigger_history_size = 8
         self.tokentrim_dino_trigger_warmup_steps = 4
         self.tokentrim_dino_trigger_z_threshold = 2.0
@@ -232,6 +234,26 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_dino_min_improvement = max(
                 0.0,
                 float(getattr(args, "tokentrim_dino_min_improvement", 0.0)),
+            )
+            self.tokentrim_dino_trigger_context_frames = max(
+                1,
+                int(
+                    getattr(
+                        args,
+                        "tokentrim_dino_trigger_context_frames",
+                        min(self.tokentrim_selector_context_frames, 2),
+                    )
+                ),
+            )
+            self.tokentrim_dino_trigger_max_frames = max(
+                1,
+                int(
+                    getattr(
+                        args,
+                        "tokentrim_dino_trigger_max_frames",
+                        min(self.tokentrim_dino_max_frames, 8),
+                    )
+                ),
             )
             self.tokentrim_dino_trigger_history_size = max(
                 1,
@@ -674,14 +696,15 @@ class CausalInferencePipeline(torch.nn.Module):
             ).eval().requires_grad_(False).to(self.tokentrim_dino_device)
         return self._tokentrim_dino_model
 
-    def _dino_frame_embeddings(self, pixel_frames):
+    def _dino_frame_embeddings(self, pixel_frames, max_frames=None):
         model = self._load_tokentrim_dino_model()
         frames = pixel_frames.flatten(0, 1)
-        if frames.shape[0] > self.tokentrim_dino_max_frames:
+        frame_limit = self.tokentrim_dino_max_frames if max_frames is None else max(1, int(max_frames))
+        if frames.shape[0] > frame_limit:
             frame_indices = torch.linspace(
                 0,
                 frames.shape[0] - 1,
-                self.tokentrim_dino_max_frames,
+                frame_limit,
                 device=frames.device,
             ).round().long()
             frames = frames.index_select(0, frame_indices)
@@ -716,10 +739,17 @@ class CausalInferencePipeline(torch.nn.Module):
             current_end_frame,
             severity,
             candidate_start_frame=None,
+            context_frames=None,
+            max_frames=None,
     ):
         if candidate_start_frame is None:
             candidate_start_frame = current_start_frame
         candidate_start_frame = max(0, min(candidate_start_frame, current_start_frame))
+        context_frame_count = (
+            self.tokentrim_selector_context_frames
+            if context_frames is None
+            else max(1, int(context_frames))
+        )
         candidate_latents = torch.cat(
             [
                 output[:, candidate_start_frame:current_start_frame],
@@ -729,7 +759,7 @@ class CausalInferencePipeline(torch.nn.Module):
         )
         context_start_frame = max(
             0,
-            candidate_start_frame - self.tokentrim_selector_context_frames,
+            candidate_start_frame - context_frame_count,
         )
         context_latents = output[:, context_start_frame:candidate_start_frame]
         with torch.no_grad():
@@ -750,12 +780,12 @@ class CausalInferencePipeline(torch.nn.Module):
                 context_pixels = None
                 candidate_pixels = self.vae.decode_to_pixel(candidate_latents, use_cache=False)
 
-            candidate_embeddings = self._dino_frame_embeddings(candidate_pixels)
+            candidate_embeddings = self._dino_frame_embeddings(candidate_pixels, max_frames=max_frames)
             del candidate_pixels
 
             subject_cost = torch.tensor(0.0, device=candidate_embeddings.device)
             if context_pixels is not None and context_pixels.shape[1] > 0:
-                context_embeddings = self._dino_frame_embeddings(context_pixels)
+                context_embeddings = self._dino_frame_embeddings(context_pixels, max_frames=max_frames)
                 del context_pixels
                 reference_embedding = torch.nn.functional.normalize(
                     context_embeddings.mean(dim=0, keepdim=True),
@@ -800,6 +830,8 @@ class CausalInferencePipeline(torch.nn.Module):
             severity,
             drift=None,
             candidate_start_frame=None,
+            context_frames=None,
+            max_frames=None,
     ):
         if self.tokentrim_rollback_selector == "drift":
             return float(severity), {"drift": float(severity)}
@@ -823,6 +855,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 current_end_frame=current_end_frame,
                 severity=severity,
                 candidate_start_frame=candidate_start_frame,
+                context_frames=context_frames,
+                max_frames=max_frames,
             )
 
         candidate_frames = denoised_pred[:, :current_end_frame - current_start_frame]
@@ -1402,6 +1436,8 @@ class CausalInferencePipeline(torch.nn.Module):
                                 or [self.tokentrim_rollback_windows]
                             ) * self.num_frame_per_block
                         ),
+                        context_frames=self.tokentrim_dino_trigger_context_frames,
+                        max_frames=self.tokentrim_dino_trigger_max_frames,
                     )
                     dino_trigger_mean = 0.0
                     dino_trigger_std = 0.0

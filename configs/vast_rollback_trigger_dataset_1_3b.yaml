@@ -72,17 +72,19 @@ tokentrim_rollback_cooldown_windows: 2
 tokentrim_rollback_resample_noise: true
 tokentrim_rollback_selector: dino
 tokentrim_selector_drift_weight: 0.0
-tokentrim_selector_context_frames: 2
+tokentrim_selector_context_frames: 10
 tokentrim_dino_model_name: vit_small_patch14_dinov2.lvd142m
 tokentrim_dino_device: cpu
 tokentrim_dino_subject_weight: 1.0
 tokentrim_dino_temporal_weight: 0.25
-tokentrim_dino_max_frames: 8
+tokentrim_dino_max_frames: 30
 tokentrim_dino_image_size: 518
-tokentrim_dino_min_improvement: 0.003
+tokentrim_dino_min_improvement: 0.006
+tokentrim_dino_trigger_context_frames: 2
+tokentrim_dino_trigger_max_frames: 8
 tokentrim_dino_trigger_history_size: 8
 tokentrim_dino_trigger_warmup_steps: 4
-tokentrim_dino_trigger_z_threshold: ${oc.env:ROLLBACK_DINO_TRIGGER_Z,2.0}
+tokentrim_dino_trigger_z_threshold: ${oc.env:ROLLBACK_DINO_TRIGGER_Z,3.0}
 
 tokentrim_checkpoint_count: 2
 tokentrim_checkpoint_device: cpu

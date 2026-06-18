@@ -47,6 +47,8 @@ tokentrim_dino_temporal_weight: 0.25
 tokentrim_dino_max_frames: 8
 tokentrim_dino_image_size: 518
 tokentrim_dino_min_improvement: 0.0
+tokentrim_dino_trigger_context_frames: 2
+tokentrim_dino_trigger_max_frames: 8
 tokentrim_dino_trigger_history_size: 8
 tokentrim_dino_trigger_warmup_steps: 4
 tokentrim_dino_trigger_z_threshold: 2.0

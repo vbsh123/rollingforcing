@@ -4,7 +4,7 @@ set -euo pipefail
 PROMPT_FILE="${PROMPT_FILE:-prompts/rollback_audit_prompts.txt}"
 SEEDS="${SEEDS:-0 1}"
 NUM_FRAMES="${NUM_FRAMES:-150}"
-ROLLBACK_DINO_TRIGGER_Z="${ROLLBACK_DINO_TRIGGER_Z:-2.0}"
+ROLLBACK_DINO_TRIGGER_Z="${ROLLBACK_DINO_TRIGGER_Z:-3.0}"
 RUN_ID="${RUN_ID:-rollback-depth-$(date -u +%Y%m%dT%H%M%SZ)}"
 RUN_ROOT="${RUN_ROOT:-rollback_dataset/${RUN_ID}}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-checkpoints/rolling_forcing_dmd.pt}"
