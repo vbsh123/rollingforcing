@@ -2,9 +2,11 @@ from collections.abc import Mapping
 from typing import List, Optional
 import copy
 import gc
+import importlib
 import json
 import os
 import random
+import tempfile
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
@@ -97,6 +99,17 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_dino_trigger_warmup_steps = 4
         self.tokentrim_dino_trigger_z_threshold = 2.0
         self._tokentrim_dino_model = None
+        self.tokentrim_stream_reward_hpsv3_class = "hpsv3.inference.HPSv3RewardInferencer"
+        self.tokentrim_stream_reward_video_class = "video_reward.inference.VideoVLMRewardInference"
+        self.tokentrim_stream_reward_hpsv3_kwargs = {}
+        self.tokentrim_stream_reward_video_kwargs = {}
+        self.tokentrim_stream_reward_video_key = "Overall"
+        self.tokentrim_stream_reward_short_weight_cap = 0.4
+        self.tokentrim_stream_reward_min_improvement = 0.0
+        self.tokentrim_stream_reward_fps = 8
+        self._tokentrim_hpsv3_reward = None
+        self._tokentrim_video_reward = None
+        self._tokentrim_current_num_frames = None
         self.tokentrim_rate_history_size = 8
         self.tokentrim_rate_warmup_steps = 3
         self.tokentrim_rate_z_threshold = 2.0
@@ -188,7 +201,7 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_rollback_selector = str(
                 getattr(args, "tokentrim_rollback_selector", "drift")
             )
-            valid_selectors = {"drift", "latent_temporal", "rate_anomaly", "dino"}
+            valid_selectors = {"drift", "latent_temporal", "rate_anomaly", "dino", "stream_reward"}
             if self.tokentrim_rollback_selector not in valid_selectors:
                 raise ValueError(
                     "tokentrim_rollback_selector must be one of "
@@ -265,6 +278,44 @@ class CausalInferencePipeline(torch.nn.Module):
             )
             self.tokentrim_dino_trigger_z_threshold = float(
                 getattr(args, "tokentrim_dino_trigger_z_threshold", 2.0)
+            )
+            self.tokentrim_stream_reward_hpsv3_class = str(
+                getattr(
+                    args,
+                    "tokentrim_stream_reward_hpsv3_class",
+                    self.tokentrim_stream_reward_hpsv3_class,
+                )
+            )
+            self.tokentrim_stream_reward_video_class = str(
+                getattr(
+                    args,
+                    "tokentrim_stream_reward_video_class",
+                    self.tokentrim_stream_reward_video_class,
+                )
+            )
+            self.tokentrim_stream_reward_hpsv3_kwargs = dict(
+                getattr(args, "tokentrim_stream_reward_hpsv3_kwargs", {}) or {}
+            )
+            self.tokentrim_stream_reward_video_kwargs = dict(
+                getattr(args, "tokentrim_stream_reward_video_kwargs", {}) or {}
+            )
+            self.tokentrim_stream_reward_video_key = str(
+                getattr(args, "tokentrim_stream_reward_video_key", "Overall")
+            )
+            self.tokentrim_stream_reward_short_weight_cap = max(
+                0.0,
+                min(
+                    1.0,
+                    float(getattr(args, "tokentrim_stream_reward_short_weight_cap", 0.4)),
+                ),
+            )
+            self.tokentrim_stream_reward_min_improvement = max(
+                0.0,
+                float(getattr(args, "tokentrim_stream_reward_min_improvement", 0.0)),
+            )
+            self.tokentrim_stream_reward_fps = max(
+                1,
+                int(getattr(args, "tokentrim_stream_reward_fps", 8)),
             )
             self.tokentrim_rate_history_size = max(
                 1,
@@ -821,6 +872,192 @@ class CausalInferencePipeline(torch.nn.Module):
         )
         return float(score), components
 
+    def _import_tokentrim_object(self, object_path, name):
+        try:
+            module_name, attr_name = object_path.rsplit(".", 1)
+        except ValueError as exc:
+            raise ValueError(
+                f"{name} must be a dotted import path, got {object_path!r}"
+            ) from exc
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            raise ImportError(
+                f"Could not import {name} module {module_name!r}. "
+                "Install the reward package and set the matching "
+                f"{name} config path."
+            ) from exc
+        try:
+            return getattr(module, attr_name)
+        except AttributeError as exc:
+            raise ImportError(
+                f"Could not find {attr_name!r} in {module_name!r} for {name}."
+            ) from exc
+
+    def _load_tokentrim_hpsv3_reward(self):
+        if self._tokentrim_hpsv3_reward is None:
+            reward_cls = self._import_tokentrim_object(
+                self.tokentrim_stream_reward_hpsv3_class,
+                "tokentrim_stream_reward_hpsv3_class",
+            )
+            print(
+                "TokenTrim HPSv3 reward load:",
+                f"class={self.tokentrim_stream_reward_hpsv3_class}",
+            )
+            self._tokentrim_hpsv3_reward = reward_cls(
+                **self.tokentrim_stream_reward_hpsv3_kwargs
+            )
+        return self._tokentrim_hpsv3_reward
+
+    def _load_tokentrim_video_reward(self):
+        if self._tokentrim_video_reward is None:
+            reward_cls = self._import_tokentrim_object(
+                self.tokentrim_stream_reward_video_class,
+                "tokentrim_stream_reward_video_class",
+            )
+            print(
+                "TokenTrim video reward load:",
+                f"class={self.tokentrim_stream_reward_video_class}",
+            )
+            self._tokentrim_video_reward = reward_cls(
+                **self.tokentrim_stream_reward_video_kwargs
+            )
+        return self._tokentrim_video_reward
+
+    def _tokentrim_pixels_to_uint8_frames(self, pixel_frames):
+        frames = pixel_frames.detach().flatten(0, 1).float().cpu()
+        frames = ((frames + 1.0) * 127.5).clamp(0, 255).to(torch.uint8)
+        return frames.permute(0, 2, 3, 1).numpy()
+
+    def _normalize_reward_values(self, values):
+        if isinstance(values, torch.Tensor):
+            return [float(item) for item in values.detach().cpu().flatten().tolist()]
+        if isinstance(values, dict):
+            if self.tokentrim_stream_reward_video_key in values:
+                return [float(values[self.tokentrim_stream_reward_video_key])]
+            if "Overall" in values:
+                return [float(values["Overall"])]
+            first_value = next(iter(values.values()))
+            return [float(first_value)]
+        if isinstance(values, (list, tuple)):
+            normalized = []
+            for value in values:
+                normalized.extend(self._normalize_reward_values(value))
+            return normalized
+        return [float(values)]
+
+    def _call_hpsv3_reward(self, prompts, image_paths):
+        reward_model = self._load_tokentrim_hpsv3_reward()
+        if hasattr(reward_model, "reward"):
+            values = reward_model.reward(prompts, image_paths)
+        elif hasattr(reward_model, "score"):
+            values = reward_model.score(prompts, image_paths)
+        else:
+            raise AttributeError("HPSv3 reward object must expose reward() or score()")
+        normalized = self._normalize_reward_values(values)
+        if len(normalized) == 1 and len(image_paths) > 1:
+            return normalized * len(image_paths)
+        return normalized
+
+    def _call_video_reward(self, prompt, video_path):
+        reward_model = self._load_tokentrim_video_reward()
+        if not hasattr(reward_model, "reward"):
+            raise AttributeError("Video reward object must expose reward()")
+        try:
+            values = reward_model.reward([video_path], [prompt], use_norm=True)
+        except TypeError:
+            values = reward_model.reward([video_path], [prompt])
+        normalized = self._normalize_reward_values(values)
+        return normalized[0]
+
+    def _score_stream_reward_candidate(
+            self,
+            output,
+            denoised_pred,
+            current_start_frame,
+            current_end_frame,
+            severity,
+            candidate_start_frame=None,
+            prompt=None,
+    ):
+        if prompt is None:
+            raise ValueError("stream_reward selector requires the text prompt")
+        if candidate_start_frame is None:
+            candidate_start_frame = current_start_frame
+        candidate_start_frame = max(0, min(candidate_start_frame, current_start_frame))
+        candidate_latents = torch.cat(
+            [
+                output[:, candidate_start_frame:current_start_frame],
+                denoised_pred[:, :self.num_frame_per_block],
+            ],
+            dim=1,
+        )
+        context_start_frame = max(
+            0,
+            candidate_start_frame - self.tokentrim_selector_context_frames,
+        )
+        context_latents = output[:, context_start_frame:candidate_start_frame]
+
+        with torch.no_grad():
+            if context_latents.shape[1] > 0:
+                combined_pixels = self.vae.decode_to_pixel(
+                    torch.cat([context_latents, candidate_latents], dim=1),
+                    use_cache=False,
+                )
+                candidate_pixel_count = min(
+                    combined_pixels.shape[1],
+                    4 * candidate_latents.shape[1],
+                )
+                candidate_pixels = combined_pixels[:, -candidate_pixel_count:]
+            else:
+                combined_pixels = self.vae.decode_to_pixel(candidate_latents, use_cache=False)
+                candidate_pixels = combined_pixels
+
+        with tempfile.TemporaryDirectory(prefix="tokentrim_stream_reward_") as tmp_dir:
+            candidate_frames = self._tokentrim_pixels_to_uint8_frames(candidate_pixels)
+            image_paths = []
+            from PIL import Image
+
+            for frame_index, frame in enumerate(candidate_frames):
+                image_path = os.path.join(tmp_dir, f"frame_{frame_index:04d}.png")
+                Image.fromarray(frame).save(image_path)
+                image_paths.append(image_path)
+
+            short_scores = self._call_hpsv3_reward(
+                [prompt] * len(image_paths),
+                image_paths,
+            )
+            short_score = sum(short_scores) / max(1, len(short_scores))
+
+            import imageio.v2 as imageio
+
+            video_path = os.path.join(tmp_dir, "candidate_window.mp4")
+            long_frames = self._tokentrim_pixels_to_uint8_frames(combined_pixels)
+            imageio.mimsave(
+                video_path,
+                list(long_frames),
+                fps=self.tokentrim_stream_reward_fps,
+            )
+            long_score = self._call_video_reward(prompt, video_path)
+
+        total_frames = self._tokentrim_current_num_frames or current_end_frame
+        denominator = max(1, total_frames - max(1, candidate_latents.shape[1]))
+        alpha = min(
+            self.tokentrim_stream_reward_short_weight_cap,
+            max(0.0, float(current_start_frame) / float(denominator)),
+        )
+        reward = alpha * short_score + (1.0 - alpha) * long_score
+        components = {
+            "stream_reward": float(reward),
+            "stream_short_reward": float(short_score),
+            "stream_long_reward": float(long_score),
+            "stream_short_weight": float(alpha),
+            "stream_video_key": self.tokentrim_stream_reward_video_key,
+            "stream_span_latents": float(candidate_latents.shape[1]),
+            "drift": float(severity),
+        }
+        return -float(reward), components
+
     def _score_tokentrim_candidate(
             self,
             output,
@@ -832,6 +1069,7 @@ class CausalInferencePipeline(torch.nn.Module):
             candidate_start_frame=None,
             context_frames=None,
             max_frames=None,
+            prompt=None,
     ):
         if self.tokentrim_rollback_selector == "drift":
             return float(severity), {"drift": float(severity)}
@@ -857,6 +1095,17 @@ class CausalInferencePipeline(torch.nn.Module):
                 candidate_start_frame=candidate_start_frame,
                 context_frames=context_frames,
                 max_frames=max_frames,
+            )
+
+        if self.tokentrim_rollback_selector == "stream_reward":
+            return self._score_stream_reward_candidate(
+                output=output,
+                denoised_pred=denoised_pred,
+                current_start_frame=current_start_frame,
+                current_end_frame=current_end_frame,
+                severity=severity,
+                candidate_start_frame=candidate_start_frame,
+                prompt=prompt,
             )
 
         candidate_frames = denoised_pred[:, :current_end_frame - current_start_frame]
@@ -1103,6 +1352,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 It is normalized to be in the range [0, 1].
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        self._tokentrim_current_num_frames = num_frames
         if self.tokentrim_enabled:
             self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
             self.tokentrim_rate_history = []
@@ -1422,13 +1672,12 @@ class CausalInferencePipeline(torch.nn.Module):
                         and window_index not in tokentrim_rollback_queues
                 ):
                     dino_trigger_eligible = window_index >= tokentrim_rollback_cooldown_until
-                    selector_score, selector_components = self._score_tokentrim_candidate(
+                    selector_score, selector_components = self._score_dino_candidate(
                         output=output,
                         denoised_pred=denoised_pred,
                         current_start_frame=current_start_frame,
                         current_end_frame=current_end_frame,
                         severity=0.0,
-                        drift=None,
                         candidate_start_frame=(
                             current_start_frame
                             - max(
@@ -1533,6 +1782,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     current_end_frame=current_end_frame,
                     severity=self.tokentrim_last_severity,
                     drift=self.tokentrim_last_drift,
+                    prompt=text_prompts[0] if text_prompts else None,
                     candidate_start_frame=(
                         current_start_frame
                         - max(
@@ -1546,7 +1796,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 if tokentrim_rate_normalize_components is not None:
                     tokentrim_active_candidate["rate_normalize_components"] = tokentrim_rate_normalize_components
                 existing_candidates = tokentrim_rollback_candidates.setdefault(window_index, [])
-                if self.tokentrim_rollback_selector == "dino":
+                if self.tokentrim_rollback_selector in {"dino", "stream_reward"}:
                     retained_candidate = next(
                         (
                             candidate
@@ -1728,6 +1978,7 @@ class CausalInferencePipeline(torch.nn.Module):
                         current_end_frame=current_end_frame,
                         severity=self.tokentrim_last_severity,
                         drift=self.tokentrim_last_drift,
+                        prompt=text_prompts[0] if text_prompts else None,
                         candidate_start_frame=(
                             current_start_frame
                             - max(
@@ -1744,7 +1995,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     original_fallbacks = []
                     if (
                             original_token_indices is not None
-                            and self.tokentrim_rollback_selector != "dino"
+                            and self.tokentrim_rollback_selector not in {"dino", "stream_reward"}
                     ):
                         for normalize_strength in self._rate_normalize_strengths():
                             fallback = self._estimate_rate_normalized_candidate(
@@ -1771,7 +2022,7 @@ class CausalInferencePipeline(torch.nn.Module):
                         "token_indices": original_token_indices,
                         "original_fallbacks": original_fallbacks,
                     })
-                    if self.tokentrim_rollback_selector == "dino":
+                    if self.tokentrim_rollback_selector in {"dino", "stream_reward"}:
                         candidates[-1]["completed_checkpoint"] = self._make_tokentrim_checkpoint(
                             next_window_index=window_index,
                             output=output,
@@ -1878,7 +2129,7 @@ class CausalInferencePipeline(torch.nn.Module):
                                 ),
                                 None,
                             )
-                            if self.tokentrim_rollback_selector == "dino":
+                            if self.tokentrim_rollback_selector in {"dino", "stream_reward"}:
                                 best_candidate = min(
                                     candidates,
                                     key=lambda candidate: candidate.get(
@@ -1886,17 +2137,22 @@ class CausalInferencePipeline(torch.nn.Module):
                                         candidate["severity"],
                                     ),
                                 )
-                                selection_reason = "dino_best_candidate"
+                                selection_reason = f"{self.tokentrim_rollback_selector}_best_candidate"
+                                min_improvement = (
+                                    self.tokentrim_dino_min_improvement
+                                    if self.tokentrim_rollback_selector == "dino"
+                                    else self.tokentrim_stream_reward_min_improvement
+                                )
                                 if (
                                         original_candidate is not None
                                         and best_candidate is not original_candidate
                                         and (
                                             original_candidate["selector_score"]
                                             - best_candidate["selector_score"]
-                                        ) < self.tokentrim_dino_min_improvement
+                                        ) < min_improvement
                                 ):
                                     best_candidate = original_candidate
-                                    selection_reason = "dino_margin_original"
+                                    selection_reason = f"{self.tokentrim_rollback_selector}_margin_original"
                             elif non_pruned_rollback_candidates:
                                 best_candidate = min(
                                     non_pruned_rollback_candidates,
@@ -2102,7 +2358,7 @@ class CausalInferencePipeline(torch.nn.Module):
                                 }
                             completed_checkpoint = best_candidate.get("completed_checkpoint")
                             if (
-                                    self.tokentrim_rollback_selector == "dino"
+                                    self.tokentrim_rollback_selector in {"dino", "stream_reward"}
                                     and completed_checkpoint is not None
                             ):
                                 self._restore_tokentrim_checkpoint(
