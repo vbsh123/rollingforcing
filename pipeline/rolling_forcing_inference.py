@@ -559,8 +559,18 @@ class CausalInferencePipeline(torch.nn.Module):
     def _format_tokentrim_selector_components(components):
         if not components:
             return "selector_components=none"
+        formatted = []
+        for key, value in sorted(components.items()):
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().item() if value.numel() == 1 else value.detach().cpu().tolist()
+            if isinstance(value, bool):
+                formatted.append(f"{key}:{value}")
+            elif isinstance(value, (int, float)):
+                formatted.append(f"{key}:{value:.4f}")
+            else:
+                formatted.append(f"{key}:{value}")
         return "selector_components=" + ",".join(
-            f"{key}:{value:.4f}" for key, value in sorted(components.items())
+            formatted
         )
 
     def _transition_rate_signal(self, drift):
