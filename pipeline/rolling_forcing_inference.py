@@ -942,6 +942,12 @@ class CausalInferencePipeline(torch.nn.Module):
                 shadowed_modules[module_key] = sys.modules.pop(module_key)
         try:
             sys.path.insert(0, videoalign_path)
+            import transformers
+
+            if not hasattr(transformers, "BloomPreTrainedModel"):
+                from transformers.models.bloom.modeling_bloom import BloomPreTrainedModel
+
+                transformers.BloomPreTrainedModel = BloomPreTrainedModel
             module = importlib.import_module(module_name)
             return getattr(module, attr_name)
         except (ImportError, AttributeError) as exc:
