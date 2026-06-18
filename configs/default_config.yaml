@@ -56,6 +56,8 @@ tokentrim_stream_reward_hpsv3_class: hpsv3.inference.HPSv3RewardInferencer
 tokentrim_stream_reward_video_class: video_reward.inference.VideoVLMRewardInference
 tokentrim_stream_reward_hpsv3_kwargs: {}
 tokentrim_stream_reward_video_kwargs: {}
+tokentrim_stream_reward_use_hpsv3: true
+tokentrim_stream_reward_use_video: true
 tokentrim_stream_reward_video_key: Overall
 tokentrim_stream_reward_short_weight_cap: 0.4
 tokentrim_stream_reward_min_improvement: 0.0

@@ -83,13 +83,16 @@ tokentrim_dino_trigger_history_size: 8
 tokentrim_dino_trigger_warmup_steps: 4
 tokentrim_dino_trigger_z_threshold: ${oc.env:ROLLBACK_DINO_TRIGGER_Z,3.0}
 
-# Defaults match Stream-T1's formula:
-# alpha * HPSv3(current chunk frames) + (1-alpha) * VideoReward(window).
-# Set class paths/kwargs to the installed reward implementations on the machine.
+# VideoReward-only first: it is the temporal part of Stream-T1's reward and
+# avoids requiring a separate HPSv3 Python wrapper.
 tokentrim_stream_reward_hpsv3_class: hpsv3.inference.HPSv3RewardInferencer
-tokentrim_stream_reward_video_class: video_reward.inference.VideoVLMRewardInference
+tokentrim_stream_reward_video_class: inference.VideoVLMRewardInference
 tokentrim_stream_reward_hpsv3_kwargs: {}
-tokentrim_stream_reward_video_kwargs: {}
+tokentrim_stream_reward_video_kwargs:
+  load_from_pretrained: /workspace/reward_models/VideoAlign/checkpoints/VideoReward
+  device: cuda
+tokentrim_stream_reward_use_hpsv3: false
+tokentrim_stream_reward_use_video: true
 tokentrim_stream_reward_video_key: Overall
 tokentrim_stream_reward_short_weight_cap: 0.4
 tokentrim_stream_reward_min_improvement: 0.0

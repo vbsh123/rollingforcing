@@ -103,6 +103,8 @@ class CausalInferencePipeline(torch.nn.Module):
         self.tokentrim_stream_reward_video_class = "video_reward.inference.VideoVLMRewardInference"
         self.tokentrim_stream_reward_hpsv3_kwargs = {}
         self.tokentrim_stream_reward_video_kwargs = {}
+        self.tokentrim_stream_reward_use_hpsv3 = True
+        self.tokentrim_stream_reward_use_video = True
         self.tokentrim_stream_reward_video_key = "Overall"
         self.tokentrim_stream_reward_short_weight_cap = 0.4
         self.tokentrim_stream_reward_min_improvement = 0.0
@@ -299,6 +301,18 @@ class CausalInferencePipeline(torch.nn.Module):
             self.tokentrim_stream_reward_video_kwargs = dict(
                 getattr(args, "tokentrim_stream_reward_video_kwargs", {}) or {}
             )
+            self.tokentrim_stream_reward_use_hpsv3 = bool(
+                getattr(args, "tokentrim_stream_reward_use_hpsv3", True)
+            )
+            self.tokentrim_stream_reward_use_video = bool(
+                getattr(args, "tokentrim_stream_reward_use_video", True)
+            )
+            if not self.tokentrim_stream_reward_use_hpsv3 and not self.tokentrim_stream_reward_use_video:
+                raise ValueError(
+                    "stream_reward selector requires at least one of "
+                    "tokentrim_stream_reward_use_hpsv3 or "
+                    "tokentrim_stream_reward_use_video"
+                )
             self.tokentrim_stream_reward_video_key = str(
                 getattr(args, "tokentrim_stream_reward_video_key", "Overall")
             )
@@ -1023,35 +1037,48 @@ class CausalInferencePipeline(torch.nn.Module):
                 Image.fromarray(frame).save(image_path)
                 image_paths.append(image_path)
 
-            short_scores = self._call_hpsv3_reward(
-                [prompt] * len(image_paths),
-                image_paths,
-            )
-            short_score = sum(short_scores) / max(1, len(short_scores))
+            short_score = 0.0
+            if self.tokentrim_stream_reward_use_hpsv3:
+                short_scores = self._call_hpsv3_reward(
+                    [prompt] * len(image_paths),
+                    image_paths,
+                )
+                short_score = sum(short_scores) / max(1, len(short_scores))
 
             import imageio.v2 as imageio
 
-            video_path = os.path.join(tmp_dir, "candidate_window.mp4")
-            long_frames = self._tokentrim_pixels_to_uint8_frames(combined_pixels)
-            imageio.mimsave(
-                video_path,
-                list(long_frames),
-                fps=self.tokentrim_stream_reward_fps,
-            )
-            long_score = self._call_video_reward(prompt, video_path)
+            long_score = 0.0
+            if self.tokentrim_stream_reward_use_video:
+                video_path = os.path.join(tmp_dir, "candidate_window.mp4")
+                long_frames = self._tokentrim_pixels_to_uint8_frames(combined_pixels)
+                imageio.mimsave(
+                    video_path,
+                    list(long_frames),
+                    fps=self.tokentrim_stream_reward_fps,
+                )
+                long_score = self._call_video_reward(prompt, video_path)
 
-        total_frames = self._tokentrim_current_num_frames or current_end_frame
-        denominator = max(1, total_frames - max(1, candidate_latents.shape[1]))
-        alpha = min(
-            self.tokentrim_stream_reward_short_weight_cap,
-            max(0.0, float(current_start_frame) / float(denominator)),
-        )
-        reward = alpha * short_score + (1.0 - alpha) * long_score
+        if self.tokentrim_stream_reward_use_hpsv3 and self.tokentrim_stream_reward_use_video:
+            total_frames = self._tokentrim_current_num_frames or current_end_frame
+            denominator = max(1, total_frames - max(1, candidate_latents.shape[1]))
+            alpha = min(
+                self.tokentrim_stream_reward_short_weight_cap,
+                max(0.0, float(current_start_frame) / float(denominator)),
+            )
+            reward = alpha * short_score + (1.0 - alpha) * long_score
+        elif self.tokentrim_stream_reward_use_hpsv3:
+            alpha = 1.0
+            reward = short_score
+        else:
+            alpha = 0.0
+            reward = long_score
         components = {
             "stream_reward": float(reward),
             "stream_short_reward": float(short_score),
             "stream_long_reward": float(long_score),
             "stream_short_weight": float(alpha),
+            "stream_use_hpsv3": self.tokentrim_stream_reward_use_hpsv3,
+            "stream_use_video": self.tokentrim_stream_reward_use_video,
             "stream_video_key": self.tokentrim_stream_reward_video_key,
             "stream_span_latents": float(candidate_latents.shape[1]),
             "drift": float(severity),
