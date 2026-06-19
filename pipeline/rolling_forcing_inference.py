@@ -830,10 +830,11 @@ class CausalInferencePipeline(torch.nn.Module):
             if context_frames is None
             else max(1, int(context_frames))
         )
+        committed_frame_count = current_end_frame - current_start_frame
         candidate_latents = torch.cat(
             [
                 output[:, candidate_start_frame:current_start_frame],
-                denoised_pred[:, :self.num_frame_per_block],
+                denoised_pred[:, :committed_frame_count],
             ],
             dim=1,
         )
@@ -1069,10 +1070,11 @@ class CausalInferencePipeline(torch.nn.Module):
         if candidate_start_frame is None:
             candidate_start_frame = current_start_frame
         candidate_start_frame = max(0, min(candidate_start_frame, current_start_frame))
+        committed_frame_count = current_end_frame - current_start_frame
         candidate_latents = torch.cat(
             [
                 output[:, candidate_start_frame:current_start_frame],
-                denoised_pred[:, :self.num_frame_per_block],
+                denoised_pred[:, :committed_frame_count],
             ],
             dim=1,
         )
