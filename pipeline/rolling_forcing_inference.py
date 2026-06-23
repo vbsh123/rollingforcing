@@ -326,36 +326,24 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.tokentrim_checkpoint_count <= 0:
             return []
         depths = self.tokentrim_rollback_depths or [self.tokentrim_rollback_windows]
-        next_window_index = current_window_index + 1
-        target_window_indices = [
-            max(0, next_window_index - depth)
-            for depth in depths
-            if depth > 0
-        ]
-        useful = []
-        seen_next_windows = set()
-        for target_window_index in target_window_indices:
-            checkpoint = self._select_tokentrim_checkpoint(checkpoints, target_window_index)
-            if checkpoint is None:
-                continue
-            checkpoint_next_window = checkpoint["next_window_index"]
-            if checkpoint_next_window in seen_next_windows:
-                continue
-            useful.append(checkpoint)
-            seen_next_windows.add(checkpoint_next_window)
+        max_depth = max([depth for depth in depths if depth > 0], default=0)
+        if max_depth <= 0:
+            return []
 
-        latest_checkpoint = max(
+        checkpoints = sorted(
             checkpoints,
             key=lambda checkpoint: checkpoint["next_window_index"],
         )
-        latest_next_window = latest_checkpoint["next_window_index"]
-        if latest_next_window not in seen_next_windows:
-            useful.append(latest_checkpoint)
+        next_window_index = current_window_index + 1
+        min_next_window = max(0, next_window_index - max_depth)
+        useful = [
+            checkpoint
+            for checkpoint in checkpoints
+            if checkpoint["next_window_index"] >= min_next_window
+        ]
 
-        max_stored = self.tokentrim_checkpoint_count + 1
-        if len(useful) > max_stored:
-            useful = useful[-max_stored:]
-        return useful
+        max_stored = max(self.tokentrim_checkpoint_count + 1, max_depth + 1)
+        return useful[-max_stored:]
 
     def _rollback_candidate_specs(self, failed_window_index, token_indices):
         depths = self.tokentrim_rollback_depths or [self.tokentrim_rollback_windows]
@@ -1669,6 +1657,9 @@ class CausalInferencePipeline(torch.nn.Module):
                             )
                             tokentrim_rollback_suppressions.clear()
                             tokentrim_rollback_rate_normalizations.clear()
+                            missing_replay_checkpoint = restore_checkpoint is None and best_candidate.get(
+                                "target_window_index", 0
+                            ) > 0
                             if (
                                     best_intervention == "original"
                                     and selection_reason == "original_adaptive_fallback"
@@ -1727,7 +1718,23 @@ class CausalInferencePipeline(torch.nn.Module):
                                     "token_indices": best_candidate.get("token_indices"),
                                 }
                             completed_checkpoint = best_candidate.get("completed_checkpoint")
-                            if (
+                            if missing_replay_checkpoint:
+                                print(
+                                    "TokenTrim rollback skipped:",
+                                    "reason=missing_selected_checkpoint",
+                                    f"window={failed_window_index}",
+                                    f"target_window={best_candidate.get('target_window_index')}",
+                                    "available_checkpoints="
+                                    + ",".join(
+                                        str(checkpoint["next_window_index"])
+                                        for checkpoint in tokentrim_checkpoints
+                                    ),
+                                )
+                                tokentrim_rollback_attempts[failed_window_index] = self.tokentrim_rollback_max_attempts
+                                tokentrim_rollback_candidates.pop(failed_window_index, None)
+                                tokentrim_rollback_queues.pop(failed_window_index, None)
+                                tokentrim_original_checkpoints.pop(failed_window_index, None)
+                            elif (
                                     self.tokentrim_rollback_selector == "dino"
                                     and completed_checkpoint is not None
                             ):
@@ -1826,7 +1833,7 @@ class CausalInferencePipeline(torch.nn.Module):
                                     torch.cuda.set_rng_state(best_candidate["cuda_rng_state"], noise.device)
                                 window_index = 0
                                 tokentrim_checkpoints.clear()
-                            if completed_checkpoint is None:
+                            if not missing_replay_checkpoint and completed_checkpoint is None:
                                 for finalizing_window in range(replay_start_window, failed_window_index + 1):
                                     tokentrim_rollback_attempts.pop(finalizing_window, None)
                                     tokentrim_rollback_candidates.pop(finalizing_window, None)
@@ -1841,66 +1848,86 @@ class CausalInferencePipeline(torch.nn.Module):
                             tokentrim_checkpoints,
                             target_window_index,
                         )
-                        cpu_rng_state = torch.get_rng_state()
-                        cuda_rng_state = torch.cuda.get_rng_state(noise.device) if noise.device.type == "cuda" else None
-                        print(
-                            "TokenTrim rollback restart:",
-                            f"from_window={window_index}",
-                            f"to_window={target_window_index}",
-                            f"checkpoint_next={restore_checkpoint['next_window_index'] if restore_checkpoint else 0}",
-                            f"attempt={attempts_used + 1}/{self.tokentrim_rollback_max_attempts}",
-                            f"candidate={len(candidates) + 1}/{len(candidate_queue)}",
-                            f"depth={candidate_spec['depth']}",
-                            f"intervention={candidate_spec['intervention']}",
-                            f"reset_rng={self.tokentrim_rollback_reset_rng}",
-                        )
-                        tokentrim_rollback_attempts[window_index] = attempts_used + 1
-                        tokentrim_active_candidate = {
-                            "window_index": window_index,
-                            "cpu_rng_state": cpu_rng_state,
-                            "cuda_rng_state": cuda_rng_state,
-                            "checkpoint": restore_checkpoint,
-                            "depth": candidate_spec["depth"],
-                            "intervention": candidate_spec["intervention"],
-                            "target_window_index": target_window_index,
-                            "token_indices": candidate_spec["token_indices"],
-                        }
-                        tokentrim_rollback_suppressions.clear()
-                        tokentrim_rollback_rate_normalizations.clear()
-                        intervention_kind, suppress_scale = self._parse_tokentrim_rollback_intervention(
-                            candidate_spec["intervention"]
-                        )
-                        tokentrim_active_candidate["intervention"] = intervention_kind
-                        tokentrim_active_candidate["suppress_scale"] = suppress_scale
-                        tokentrim_active_candidate["intervention_strength"] = suppress_scale
-                        if intervention_kind in {"suppress", "soft_suppress"} and candidate_spec["token_indices"] is not None:
-                            tokentrim_rollback_suppressions[target_window_index] = {
-                                "token_indices": candidate_spec["token_indices"],
-                                "scale": suppress_scale,
-                                "intervention": intervention_kind,
-                            }
-                        if restore_checkpoint is not None:
-                            window_index = self._restore_tokentrim_checkpoint(
-                                restore_checkpoint,
-                                output,
-                                noisy_cache,
-                                cpu_rng_state=initial_cpu_rng_state if self.tokentrim_rollback_reset_rng else cpu_rng_state,
-                                cuda_rng_state=initial_cuda_rng_state if self.tokentrim_rollback_reset_rng else cuda_rng_state,
+                        if restore_checkpoint is None and target_window_index > 0:
+                            print(
+                                "TokenTrim rollback skipped:",
+                                "reason=missing_restart_checkpoint",
+                                f"from_window={window_index}",
+                                f"target_window={target_window_index}",
+                                f"attempt={attempts_used + 1}/{self.tokentrim_rollback_max_attempts}",
+                                f"candidate={len(candidates) + 1}/{len(candidate_queue)}",
+                                f"depth={candidate_spec['depth']}",
+                                "available_checkpoints="
+                                + ",".join(
+                                    str(checkpoint["next_window_index"])
+                                    for checkpoint in tokentrim_checkpoints
+                                ),
                             )
+                            tokentrim_rollback_attempts[window_index] = attempts_used + 1
+                            tokentrim_rollback_queues.pop(window_index, None)
+                            tokentrim_rollback_candidates.pop(window_index, None)
+                            tokentrim_original_checkpoints.pop(window_index, None)
                         else:
-                            output.zero_()
-                            noisy_cache.zero_()
-                            self._reset_clean_cache(noise.device)
-                            self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
-                            self.tokentrim_rate_history = []
-                            self.tokentrim_prev_summary = None
-                            self.tokentrim_prev_start_frame = None
-                            if self.tokentrim_rollback_reset_rng and initial_cpu_rng_state is not None:
-                                torch.set_rng_state(initial_cpu_rng_state)
-                                if initial_cuda_rng_state is not None:
-                                    torch.cuda.set_rng_state(initial_cuda_rng_state, noise.device)
-                            window_index = 0
-                        continue
+                            cpu_rng_state = torch.get_rng_state()
+                            cuda_rng_state = torch.cuda.get_rng_state(noise.device) if noise.device.type == "cuda" else None
+                            print(
+                                "TokenTrim rollback restart:",
+                                f"from_window={window_index}",
+                                f"to_window={target_window_index}",
+                                f"checkpoint_next={restore_checkpoint['next_window_index'] if restore_checkpoint else 0}",
+                                f"attempt={attempts_used + 1}/{self.tokentrim_rollback_max_attempts}",
+                                f"candidate={len(candidates) + 1}/{len(candidate_queue)}",
+                                f"depth={candidate_spec['depth']}",
+                                f"intervention={candidate_spec['intervention']}",
+                                f"reset_rng={self.tokentrim_rollback_reset_rng}",
+                            )
+                            tokentrim_rollback_attempts[window_index] = attempts_used + 1
+                            tokentrim_active_candidate = {
+                                "window_index": window_index,
+                                "cpu_rng_state": cpu_rng_state,
+                                "cuda_rng_state": cuda_rng_state,
+                                "checkpoint": restore_checkpoint,
+                                "depth": candidate_spec["depth"],
+                                "intervention": candidate_spec["intervention"],
+                                "target_window_index": target_window_index,
+                                "token_indices": candidate_spec["token_indices"],
+                            }
+                            tokentrim_rollback_suppressions.clear()
+                            tokentrim_rollback_rate_normalizations.clear()
+                            intervention_kind, suppress_scale = self._parse_tokentrim_rollback_intervention(
+                                candidate_spec["intervention"]
+                            )
+                            tokentrim_active_candidate["intervention"] = intervention_kind
+                            tokentrim_active_candidate["suppress_scale"] = suppress_scale
+                            tokentrim_active_candidate["intervention_strength"] = suppress_scale
+                            if intervention_kind in {"suppress", "soft_suppress"} and candidate_spec["token_indices"] is not None:
+                                tokentrim_rollback_suppressions[target_window_index] = {
+                                    "token_indices": candidate_spec["token_indices"],
+                                    "scale": suppress_scale,
+                                    "intervention": intervention_kind,
+                                }
+                            if restore_checkpoint is not None:
+                                window_index = self._restore_tokentrim_checkpoint(
+                                    restore_checkpoint,
+                                    output,
+                                    noisy_cache,
+                                    cpu_rng_state=initial_cpu_rng_state if self.tokentrim_rollback_reset_rng else cpu_rng_state,
+                                    cuda_rng_state=initial_cuda_rng_state if self.tokentrim_rollback_reset_rng else cuda_rng_state,
+                                )
+                            else:
+                                output.zero_()
+                                noisy_cache.zero_()
+                                self._reset_clean_cache(noise.device)
+                                self.tokentrim_state = self._tokentrim_state_cls(self.tokentrim_config)
+                                self.tokentrim_rate_history = []
+                                self.tokentrim_prev_summary = None
+                                self.tokentrim_prev_start_frame = None
+                                if self.tokentrim_rollback_reset_rng and initial_cpu_rng_state is not None:
+                                    torch.set_rng_state(initial_cpu_rng_state)
+                                    if initial_cuda_rng_state is not None:
+                                        torch.cuda.set_rng_state(initial_cuda_rng_state, noise.device)
+                                window_index = 0
+                            continue
 
             output[:, current_start_frame:current_end_frame] = denoised_pred
             if self.tokentrim_enabled:
