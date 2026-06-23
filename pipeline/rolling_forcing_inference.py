@@ -1620,14 +1620,38 @@ class CausalInferencePipeline(torch.nn.Module):
                                 best_candidate = original_candidate
                                 selection_reason = "original_adaptive_fallback"
                             else:
-                                best_candidate = min(
-                                    candidates,
-                                    key=lambda candidate: candidate.get(
-                                        "selector_score",
-                                        candidate["severity"],
-                                    ),
+                                original_checkpoint = (
+                                    self._select_tokentrim_checkpoint(
+                                        tokentrim_checkpoints,
+                                        window_index,
+                                    )
+                                    or self._make_tokentrim_checkpoint(
+                                        next_window_index=window_index,
+                                        output=output,
+                                        noisy_cache=noisy_cache,
+                                    )
                                 )
-                                selection_reason = "best_available_no_original"
+                                best_candidate = {
+                                    "window_index": window_index,
+                                    "severity": self.tokentrim_last_severity,
+                                    "pruned": self.tokentrim_last_pruned,
+                                    "selector_score": self.tokentrim_last_severity,
+                                    "selector_components": {
+                                        "drift": self.tokentrim_last_severity,
+                                    },
+                                    "cpu_rng_state": pregeneration_cpu_rng_state,
+                                    "cuda_rng_state": pregeneration_cuda_rng_state,
+                                    "checkpoint": original_checkpoint,
+                                    "depth": 0,
+                                    "intervention": "original",
+                                    "target_window_index": window_index,
+                                    "token_indices": (
+                                        None
+                                        if self.tokentrim_last_token_indices is None
+                                        else self.tokentrim_last_token_indices.detach()
+                                    ),
+                                }
+                                selection_reason = "original_pruned_fallback"
                             restore_checkpoint = best_candidate.get("checkpoint")
                             best_intervention = best_candidate.get("intervention")
                             best_depth = best_candidate.get("depth")
