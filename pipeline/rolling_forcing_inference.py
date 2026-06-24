@@ -1620,38 +1620,14 @@ class CausalInferencePipeline(torch.nn.Module):
                                 best_candidate = original_candidate
                                 selection_reason = "original_adaptive_fallback"
                             else:
-                                original_checkpoint = (
-                                    self._select_tokentrim_checkpoint(
-                                        tokentrim_checkpoints,
-                                        window_index,
-                                    )
-                                    or self._make_tokentrim_checkpoint(
-                                        next_window_index=window_index,
-                                        output=output,
-                                        noisy_cache=noisy_cache,
-                                    )
-                                )
-                                best_candidate = {
-                                    "window_index": window_index,
-                                    "severity": self.tokentrim_last_severity,
-                                    "pruned": self.tokentrim_last_pruned,
-                                    "selector_score": self.tokentrim_last_severity,
-                                    "selector_components": {
-                                        "drift": self.tokentrim_last_severity,
-                                    },
-                                    "cpu_rng_state": pregeneration_cpu_rng_state,
-                                    "cuda_rng_state": pregeneration_cuda_rng_state,
-                                    "checkpoint": original_checkpoint,
-                                    "depth": 0,
-                                    "intervention": "original",
-                                    "target_window_index": window_index,
-                                    "token_indices": (
-                                        None
-                                        if self.tokentrim_last_token_indices is None
-                                        else self.tokentrim_last_token_indices.detach()
+                                best_candidate = min(
+                                    candidates,
+                                    key=lambda candidate: candidate.get(
+                                        "selector_score",
+                                        candidate["severity"],
                                     ),
-                                }
-                                selection_reason = "original_pruned_fallback"
+                                )
+                                selection_reason = "best_available_no_original"
                             restore_checkpoint = best_candidate.get("checkpoint")
                             best_intervention = best_candidate.get("intervention")
                             best_depth = best_candidate.get("depth")
@@ -1826,6 +1802,32 @@ class CausalInferencePipeline(torch.nn.Module):
                                     "TokenTrim rollback commit:",
                                     f"window={failed_window_index}",
                                     "state=completed_candidate",
+                                    f"next_window={failed_window_index + 1}",
+                                    f"cooldown_until={tokentrim_rollback_cooldown_until}",
+                                )
+                            elif (
+                                    selection_reason == "best_available_no_original"
+                                    and best_intervention != "original"
+                                    and best_candidate.get("window_index") == failed_window_index
+                            ):
+                                replay_start_window = best_candidate["target_window_index"]
+                                for finalized_window in range(replay_start_window, failed_window_index + 1):
+                                    tokentrim_rollback_attempts.pop(finalized_window, None)
+                                    tokentrim_rollback_candidates.pop(finalized_window, None)
+                                    tokentrim_rollback_queues.pop(finalized_window, None)
+                                    tokentrim_original_checkpoints.pop(finalized_window, None)
+                                    tokentrim_finalizing_windows.discard(finalized_window)
+                                tokentrim_rollback_suppressions.clear()
+                                tokentrim_rollback_rate_normalizations.clear()
+                                tokentrim_rollback_cooldown_until = (
+                                    failed_window_index
+                                    + self.tokentrim_rollback_cooldown_windows
+                                    + 1
+                                )
+                                print(
+                                    "TokenTrim rollback commit:",
+                                    f"window={failed_window_index}",
+                                    "state=current_replayed_candidate",
                                     f"next_window={failed_window_index + 1}",
                                     f"cooldown_until={tokentrim_rollback_cooldown_until}",
                                 )
